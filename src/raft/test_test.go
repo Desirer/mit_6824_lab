@@ -22,8 +22,6 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
-	defer cfg.cleanup()
-
 	cfg.begin("Test (2A): initial election")
 
 	// is a leader elected?
@@ -185,7 +183,7 @@ func TestFollowerFailure2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
-	cfg.begin("Test (2B): test progressive failure of followers")
+	cfg.begin("Test (2B3): test progressive failure of followers")
 
 	cfg.one(101, servers, false)
 

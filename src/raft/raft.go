@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,20 +15,10 @@ const (
 	candidate = 2
 	leader    = 3
 )
-const FRESH_TIME = time.Duration(50) * time.Millisecond
-const HEART_BEAT_INTERVAL = time.Duration(150) * time.Millisecond
-const ELECTION_BASE_TIME = 400
 
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-
-	// For 2D:
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
+type Entry struct {
+	Term    int
+	Command interface{}
 }
 
 type Raft struct {
@@ -40,12 +31,22 @@ type Raft struct {
 	state       int
 	currentTerm int
 	votedFor    int
+	log         []Entry       //存储每条log
+	applyCh     chan ApplyMsg //用于提交entry
+	applyCond   *sync.Cond    // 条件变量，用于applyEntry协程
 
-	count                 int //投票数
-	election_start_time   time.Time
-	election_interval     time.Duration
-	heart_beat_start_time time.Time
-	heart_beat_interval   time.Duration
+	// volatile on each server
+	commitIndex int //已经提交的最大 log entry 的index
+	lastApplied int //向客户端回复的最大 log entry 的index
+
+	// leader 独有
+	nextIndex  []int // 要向每个server发送的下一条 log entry 的index
+	matchIndex []int // 与每个server同步复制的entry的最大index
+
+	// 辅助变量
+	count         int //投票数
+	electionTimer Timer
+	pingTimer     Timer
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -72,13 +73,21 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	state := rf.state
+	index := len(rf.log)
+	term := rf.currentTerm
+	if state != leader {
+		return index, term, false
+	}
 
-	// Your code here (2B).
+	rf.log = append(rf.log, Entry{term, command})
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+	Debug(dClient, "%v append a command, log is %v", rf.info, rf.log)
 
-	return index, term, isLeader
+	go rf.logReplication()
+	return index, term, true
 }
 
 func (rf *Raft) Kill() {
@@ -98,22 +107,25 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 		switch state {
 		case follower:
-			if rf.passElectionTime() {
+			if rf.electionTimer.passTime() {
 				rf.mu.Lock()
 				rf.becomeCandidate()
 				rf.mu.Unlock()
+				rf.electionTimer.reset(getRandElectTimeout())
 				rf.doElection()
 			}
 		case candidate:
-			if rf.passElectionTime() {
+			if rf.electionTimer.passTime() {
 				rf.mu.Lock()
 				rf.becomeCandidate()
 				rf.mu.Unlock()
+				rf.electionTimer.reset(getRandElectTimeout())
 				rf.doElection()
 			}
 		case leader:
-			if rf.passHeartBeatTime() {
-				rf.heartBeat()
+			if rf.pingTimer.passTime() {
+				rf.pingTimer.reset(HEART_BEAT_INTERVAL)
+				rf.logReplication()
 			}
 		}
 		time.Sleep(FRESH_TIME)
@@ -131,11 +143,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.heart_beat_interval = HEART_BEAT_INTERVAL
-	rf.election_start_time = time.Now()             //设置选举定时器
-	rf.election_interval = rf.getRandElectTimeout() //设置选举过时时间
+	rf.electionTimer = Timer{}
+	rf.pingTimer = Timer{}
+	rf.log = make([]Entry, 0)
+	rf.log = append(rf.log, Entry{
+		Term:    -1,
+		Command: -1,
+	})
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
+
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.electionTimer.reset(getRandElectTimeout())
+	rf.pingTimer.reset(HEART_BEAT_INTERVAL)
 	go rf.ticker()
+	go rf.applyLoop()
 
 	return rf
 }
@@ -153,13 +178,23 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.persist()
-	rf.election_interval = rf.getRandElectTimeout() //重新设置选举时间
-	Debug(dLog, "S%d become follower", rf.me)
+	rf.electionTimer.reset(getRandElectTimeout())
+	Debug(dTimer, "S%v reset election timer", rf.me)
+	//Debug(dLog, "S%d become follower", rf.me)
 }
 
 func (rf *Raft) becomeLeader() {
 	rf.state = leader
 	rf.persist()
-	go rf.heartBeat()
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for j, _ := range rf.peers {
+		rf.nextIndex[j] = len(rf.log)
+	}
+	//go rf.logReplication()
 	Debug(dLog, "S%d become leader", rf.me)
+}
+
+func (rf *Raft) info() string {
+	return fmt.Sprintf("T%v S%v", rf.currentTerm, rf.me)
 }

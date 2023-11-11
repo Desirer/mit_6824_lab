@@ -1,21 +1,10 @@
 package raft
 
-import (
-	"math/rand"
-	"time"
-)
-
-func (rf *Raft) passElectionTime() bool {
-	return time.Since(rf.election_start_time) > rf.election_interval
-}
-
-func (rf *Raft) getRandElectTimeout() time.Duration {
-	return time.Duration(ELECTION_BASE_TIME+rand.Int63()%ELECTION_BASE_TIME) * time.Millisecond
-}
-
 type RequestVoteArgs struct {
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 type RequestVoteReply struct {
@@ -24,33 +13,47 @@ type RequestVoteReply struct {
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	Debug(dVote, "S%d send requestVote to S%d", args.CandidateId, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+func up_to_date(term1 int, len1 int, term2 int, len2 int) bool {
+	if term1 != term2 {
+		return term1 > term2
+	}
+	return len1 > len2
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	Debug(dVote, "S%d receive VoteAsk from S%d", rf.me, args.CandidateId)
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		Debug(dVote, "S%d receive VoteAsk from S%d", rf.me, args.CandidateId)
+		Debug(dVote, "S%d deny VoteAsk from S%d, case of old term", rf.me, args.CandidateId)
 		return
 	}
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
 	}
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
-		rf.election_start_time = time.Now() //重新设置选举定时器
+	if up_to_date(rf.log[len(rf.log)-1].Term, len(rf.log), args.LastLogTerm, 1+args.LastLogIndex) {
+		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		Debug(dVote, "S%d  VoteGranted to S%d", rf.me, args.CandidateId)
+		Debug(dVote, "S%d deny VoteAsk from S%d, case of old log", rf.me, args.CandidateId)
 		return
 	}
-	reply.VoteGranted = false
+	if !(rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		Debug(dVote, "S%d deny VoteAsk from S%d, case of repeated VF ", rf.me, args.CandidateId)
+		return
+	}
+	rf.votedFor = args.CandidateId
+	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
-	Debug(dVote, "S%d  VoteDeny to S%d", rf.me, args.CandidateId)
+	rf.electionTimer.reset(getRandElectTimeout()) // 同意投票后重置选举定时器
+	Debug(dVote, "S%d VoteGranted to S%d", rf.me, args.CandidateId)
 	return
 }
 
@@ -58,11 +61,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) doElection() {
 	rf.mu.Lock()
 	Debug(dVote, "S%d start election", rf.me)
-	rf.election_start_time = time.Now() //重新设置选举定时器
-	rf.election_interval = rf.getRandElectTimeout()
+	lastLogIndex := len(rf.log) - 1
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  rf.log[lastLogIndex].Term,
 	}
 	rf.count = 1 //投一票给自己
 	rf.mu.Unlock()
@@ -75,31 +79,29 @@ func (rf *Raft) doElection() {
 }
 func (rf *Raft) askVote(targetServerId int, args *RequestVoteArgs) {
 	reply := RequestVoteReply{}
-	Debug(dVote, "S%d send requestVote to S%d", rf.me, targetServerId)
 	ok := rf.sendRequestVote(targetServerId, args, &reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !ok {
-		return
-	}
-	if rf.state != candidate {
+		Debug(dVote, "S%d can't send vote to S%d", rf.me, targetServerId)
 		return
 	}
 	if reply.Term > rf.currentTerm {
 		rf.becomeFollower(reply.Term)
 		return
 	}
-	if reply.Term != rf.currentTerm {
+	// RPC前后状态一致性校验
+	if rf.state != candidate && reply.Term != rf.currentTerm {
+		Debug(dVote, "S%d receive old vote reply from S%d", rf.me, targetServerId)
 		return
 	}
-	if reply.VoteGranted {
-		rf.count++
-		Debug(dVote, "S%d receive VoteGranted from S%d", rf.me, targetServerId)
-		if 2*rf.count > len(rf.peers) {
-			rf.becomeLeader()
-		}
-	} else {
+	if !reply.VoteGranted {
 		Debug(dVote, "S%d receive VoteDeny from S%d", rf.me, targetServerId)
 		return
+	}
+	rf.count++
+	Debug(dVote, "S%d receive VoteGranted from S%d", rf.me, targetServerId)
+	if rf.state == candidate && 2*rf.count > len(rf.peers) {
+		rf.becomeLeader()
 	}
 }
