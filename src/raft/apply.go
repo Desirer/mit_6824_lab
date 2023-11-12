@@ -27,7 +27,7 @@ func (rf *Raft) applyLoop() {
 				CommandIndex: rf.lastApplied,
 			}
 			rf.applyCh <- applyMsg
-			Debug(dCommit, "%v commit index%v command%v", rf.info(), applyMsg.CommandIndex, applyMsg.Command)
+			Debug(dCommit, "S%v commit index%v command%v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
 		}
 		rf.mu.Unlock()
 	}

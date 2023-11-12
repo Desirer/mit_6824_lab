@@ -84,7 +84,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, Entry{term, command})
 	rf.matchIndex[rf.me] = len(rf.log) - 1
-	Debug(dClient, "%v append a command, log is %v", rf.info, rf.log)
+	Debug(dCommit, "S%v append a command %v", rf.me, command)
 
 	go rf.logReplication()
 	return index, term, true
@@ -178,9 +178,7 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.persist()
-	rf.electionTimer.reset(getRandElectTimeout())
-	Debug(dTimer, "S%v reset election timer", rf.me)
-	//Debug(dLog, "S%d become follower", rf.me)
+	//Debug(dLog, "S%d become candidate", rf.me)
 }
 
 func (rf *Raft) becomeLeader() {
@@ -192,9 +190,9 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[j] = len(rf.log)
 	}
 	//go rf.logReplication()
-	Debug(dLog, "S%d become leader", rf.me)
+	Debug(dLog, "S%d become leader, log is %v", rf.me, rf.log)
 }
 
 func (rf *Raft) info() string {
-	return fmt.Sprintf("T%v S%v", rf.currentTerm, rf.me)
+	return fmt.Sprintf("S%vT%v", rf.me, rf.currentTerm)
 }

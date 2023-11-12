@@ -2,6 +2,7 @@ package raft
 
 import (
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -12,15 +13,20 @@ const HEART_BEAT_INTERVAL = time.Duration(150) * time.Millisecond
 const ELECTION_BASE_TIME = 400
 
 type Timer struct {
+	mu        sync.Mutex
 	last_time time.Time
 	interval  time.Duration
 }
 
 func (t *Timer) passTime() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	return time.Since(t.last_time) > t.interval
 }
 
 func (t *Timer) reset(interval time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.last_time = time.Now()
 	t.interval = interval
 }

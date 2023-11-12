@@ -31,7 +31,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		Debug(dVote, "S%d deny VoteAsk from S%d, case of old term", rf.me, args.CandidateId)
+		Debug(dVote, "S%d deny VoteAsk from S%d, old term", rf.me, args.CandidateId)
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -40,13 +40,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if up_to_date(rf.log[len(rf.log)-1].Term, len(rf.log), args.LastLogTerm, 1+args.LastLogIndex) {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		Debug(dVote, "S%d deny VoteAsk from S%d, case of old log", rf.me, args.CandidateId)
+		Debug(dVote, "S%d deny VoteAsk from S%d, old log", rf.me, args.CandidateId)
 		return
 	}
 	if !(rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		Debug(dVote, "S%d deny VoteAsk from S%d, case of repeated VF ", rf.me, args.CandidateId)
+		Debug(dVote, "S%d deny VoteAsk from S%d, repeated VF ", rf.me, args.CandidateId)
 		return
 	}
 	rf.votedFor = args.CandidateId
@@ -68,16 +68,17 @@ func (rf *Raft) doElection() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  rf.log[lastLogIndex].Term,
 	}
-	rf.count = 1 //投一票给自己
+	//rf.count = 1 //投一票给自己
+	count := 1
 	rf.mu.Unlock()
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		go rf.askVote(i, &args)
+		go rf.askVote(i, &args, &count)
 	}
 }
-func (rf *Raft) askVote(targetServerId int, args *RequestVoteArgs) {
+func (rf *Raft) askVote(targetServerId int, args *RequestVoteArgs, count *int) {
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(targetServerId, args, &reply)
 	rf.mu.Lock()
@@ -99,9 +100,9 @@ func (rf *Raft) askVote(targetServerId int, args *RequestVoteArgs) {
 		Debug(dVote, "S%d receive VoteDeny from S%d", rf.me, targetServerId)
 		return
 	}
-	rf.count++
+	(*count)++
 	Debug(dVote, "S%d receive VoteGranted from S%d", rf.me, targetServerId)
-	if rf.state == candidate && 2*rf.count > len(rf.peers) {
+	if rf.state == candidate && 2*(*count) > len(rf.peers) {
 		rf.becomeLeader()
 	}
 }

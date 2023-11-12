@@ -83,3 +83,9 @@ func minInteger(a int, b int) int {
 	}
 	return b
 }
+func maxInteger(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
