@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -44,7 +46,6 @@ type Raft struct {
 	matchIndex []int // 与每个server同步复制的entry的最大index
 
 	// 辅助变量
-	count         int //投票数
 	electionTimer Timer
 	pingTimer     Timer
 }
@@ -60,11 +61,27 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-func (rf *Raft) persist() {}
+func (rf *Raft) persist() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
+	Debug(dPersist, "S%v persist", rf.me)
+}
 
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		Debug(dWarn, "S%v read blank state", rf.me)
 		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil ||
+		d.Decode(&rf.log) != nil {
+		panic("decode wrong!")
 	}
 }
 
@@ -84,7 +101,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, Entry{term, command})
 	rf.matchIndex[rf.me] = len(rf.log) - 1
-	Debug(dCommit, "S%v append a command %v", rf.me, command)
+	Debug(dCommit, "S%v append a command %v, log is %v", rf.me, command, rf.log)
+	rf.persist()
 
 	go rf.logReplication()
 	return index, term, true
@@ -154,8 +172,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
-
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Lock()
+	if rf.state == leader {
+		rf.becomeLeader()
+	}
+	Debug(dPersist, "S%v recover, log is %v", rf.me, rf.log)
+	rf.mu.Unlock()
 
 	rf.electionTimer.reset(getRandElectTimeout())
 	rf.pingTimer.reset(HEART_BEAT_INTERVAL)
@@ -190,7 +213,7 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[j] = len(rf.log)
 	}
 	//go rf.logReplication()
-	Debug(dLog, "S%d become leader, log is %v", rf.me, rf.log)
+	Debug(dLog, "S%d become leader,log is %v", rf.me, rf.log)
 }
 
 func (rf *Raft) info() string {

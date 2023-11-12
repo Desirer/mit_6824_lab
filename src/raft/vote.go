@@ -49,9 +49,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		Debug(dVote, "S%d deny VoteAsk from S%d, repeated VF ", rf.me, args.CandidateId)
 		return
 	}
-	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
+	rf.votedFor = args.CandidateId
+	rf.persist()
 	rf.electionTimer.reset(getRandElectTimeout()) // 同意投票后重置选举定时器
 	Debug(dVote, "S%d VoteGranted to S%d", rf.me, args.CandidateId)
 	return
@@ -68,7 +69,6 @@ func (rf *Raft) doElection() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  rf.log[lastLogIndex].Term,
 	}
-	//rf.count = 1 //投一票给自己
 	count := 1
 	rf.mu.Unlock()
 	for i, _ := range rf.peers {
@@ -79,6 +79,12 @@ func (rf *Raft) doElection() {
 	}
 }
 func (rf *Raft) askVote(targetServerId int, args *RequestVoteArgs, count *int) {
+	rf.mu.Lock()
+	if rf.state != candidate {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(targetServerId, args, &reply)
 	rf.mu.Lock()
@@ -92,7 +98,7 @@ func (rf *Raft) askVote(targetServerId int, args *RequestVoteArgs, count *int) {
 		return
 	}
 	// RPC前后状态一致性校验
-	if rf.state != candidate && reply.Term != rf.currentTerm {
+	if rf.state != candidate || reply.Term != rf.currentTerm {
 		Debug(dVote, "S%d receive old vote reply from S%d", rf.me, targetServerId)
 		return
 	}

@@ -8,9 +8,11 @@ import (
 
 const FRESH_TIME = time.Duration(50) * time.Millisecond
 
-const HEART_BEAT_INTERVAL = time.Duration(150) * time.Millisecond
+const HEART_BEAT_INTERVAL = time.Duration(100) * time.Millisecond
 
-const ELECTION_BASE_TIME = 400
+const ELECTION_MIN_TIME = 800
+
+const ELECTION_MAX_TIME = 1200
 
 type Timer struct {
 	mu        sync.Mutex
@@ -32,5 +34,5 @@ func (t *Timer) reset(interval time.Duration) {
 }
 
 func getRandElectTimeout() time.Duration {
-	return time.Duration(ELECTION_BASE_TIME+rand.Int63()%ELECTION_BASE_TIME) * time.Millisecond
+	return time.Duration(ELECTION_MIN_TIME+rand.Int63()%(ELECTION_MAX_TIME-ELECTION_MIN_TIME)) * time.Millisecond
 }

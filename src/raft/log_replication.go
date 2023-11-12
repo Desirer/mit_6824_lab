@@ -34,6 +34,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	if len(args.Entries) == 0 {
 		Debug(dTimer, "S%d receive HeartMsg from S%d", rf.me, args.LeaderId)
 	} else {
@@ -42,10 +43,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		Debug(dLeader, "S%d deny AEMsg from S%d, cause of old term", rf.me, args.LeaderId)
+		Debug(dLeader, "S%d deny AEMsg from S%d, old term", rf.me, args.LeaderId)
 		return
 	}
-	rf.becomeFollower(args.Term)
+	//rf.becomeFollower(args.Term)
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+	if rf.state == candidate {
+		rf.state = follower
+		rf.persist()
+	}
+
 	rf.electionTimer.reset(getRandElectTimeout()) //收到current leader的消息就应该重新设置选举定时器
 	// 0、最后一条log的index比preLogIndex小
 	if len(rf.log)-1 < args.PrevLogIndex {
@@ -53,7 +62,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Xterm = -1
 		reply.Xlen = len(rf.log)
-		Debug(dLeader, "S%d deny AEMsg from S%d, cause of short log", rf.me, args.LeaderId)
+		reply.Xindex = -1
+		Debug(dLeader, "S%d deny AEMsg from S%d, short log, reply is %v", rf.me, args.LeaderId, reply)
 		return
 	}
 	// 1、最后一条log的index大于等于preLogIndex
@@ -61,14 +71,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.Xterm = rf.log[args.PrevLogIndex].Term
-		// 找到Xterm任期的第一条log位置
+		reply.Xindex = 1
+		// 找到Xterm任期的第一条log位置(Xterm的index为1的情况）
 		for idx := args.PrevLogIndex; idx >= 1; idx-- {
 			if rf.log[idx-1].Term != reply.Xterm {
 				reply.Xindex = idx
 				break
 			}
 		}
-		Debug(dLeader, "S%d deny AEMsg from S%d, cause of mismatch log at PrevLogIndex", rf.me, args.LeaderId)
+		Debug(dLeader, "S%d deny AEMsg from S%d, mismatch log", rf.me, args.LeaderId)
 		return
 	}
 	// append or overwrite Enries from leader
@@ -79,8 +90,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if len(rf.log)-1 >= index {
 			rf.log[index] = entry // overwrite
-		}
-		if len(rf.log)-1 < index {
+		} else {
 			rf.log = append(rf.log, entry) //append
 		}
 	}
@@ -98,7 +108,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) == 0 {
 		Debug(dTimer, "S%d agree HeartMsg from S%d", rf.me, args.LeaderId)
 	} else {
-		Debug(dLeader, "S%d agree AEMsg from S%d", rf.me, args.LeaderId)
+		Debug(dLeader, "S%d agree AEMsg from S%d, log is %v", rf.me, args.LeaderId, rf.log)
 	}
 	return
 }
@@ -118,6 +128,9 @@ func (rf *Raft) sendEntry(targetServerId int) {
 		return
 	}
 	prevLogIndex := rf.nextIndex[targetServerId] - 1
+	if prevLogIndex == -1 {
+		Debug(dWarn, "S%v, nextIndex is %v", rf.me, rf.nextIndex)
+	}
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -131,9 +144,9 @@ func (rf *Raft) sendEntry(targetServerId int) {
 	ok := rf.sendAppendEntries(targetServerId, &args, &reply)
 	if !ok {
 		if len(args.Entries) == 0 {
-			Debug(dTimer, "S%d can't send HeartMsg to S%d", args.LeaderId, targetServerId)
+			Debug(dLog2, "S%d can't send HeartMsg to S%d", args.LeaderId, targetServerId)
 		} else {
-			Debug(dLeader, "S%d can't send AEMsg to S%d", args.LeaderId, targetServerId)
+			Debug(dLog2, "S%d can't send AEMsg to S%d", args.LeaderId, targetServerId)
 		}
 		return
 	}
@@ -142,9 +155,10 @@ func (rf *Raft) sendEntry(targetServerId int) {
 	if reply.Term > rf.currentTerm {
 		rf.becomeFollower(reply.Term)
 		Debug(dLog, "S%v become follower ", rf.me)
+		return
 	}
 	// RPC发送前后状态一致性校验
-	if rf.state != leader && args.Term != rf.currentTerm {
+	if rf.state != leader || args.Term != rf.currentTerm {
 		if len(args.Entries) == 0 {
 			Debug(dTimer, "S%d receive old HeartMsg reply from S%d", args.LeaderId, targetServerId)
 		} else {
@@ -169,6 +183,9 @@ func (rf *Raft) sendEntry(targetServerId int) {
 				rf.nextIndex[targetServerId] = pos + 1
 			}
 		}
+		//if rf.nextIndex[targetServerId] <= 0 {
+		//	Debug(dWarn, "S%v, log is%v,nextIndex is %v, tS is %v, reply is %v, args.Term %v, currentTerm %v", rf.me, rf.log, rf.nextIndex, targetServerId, reply, args.Term, rf.currentTerm)
+		//}
 		if len(args.Entries) == 0 {
 			Debug(dTimer, "S%d receive disagree HeartMsg reply from S%d", args.LeaderId, targetServerId)
 		} else {
