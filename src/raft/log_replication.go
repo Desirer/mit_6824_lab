@@ -66,14 +66,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if rf.log.get(args.PrevLogIndex).Term != args.PrevLogTerm {
+	if rf.getLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.Xterm = rf.log.get(args.PrevLogIndex).Term
-		reply.Xindex = rf.log.FirstLogIndex
-		// 找到Xterm任期的第一条log位置(Xterm的index为1的情况）
+		reply.Xindex = rf.snapLastLogIndex //兜底
+		// 找到Xterm任期的第一条log位置(可能进行过快照）
 		for idx := args.PrevLogIndex; idx >= rf.log.FirstLogIndex; idx-- {
-			if rf.log.get(idx-1).Term != reply.Xterm {
+			if rf.getLogTerm(idx-1) != reply.Xterm {
 				reply.Xindex = idx
 				break
 			}
@@ -100,7 +100,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//index_of_last_new_entry := args.PrevLogIndex + len(args.Entries)
 		index_of_last_new_entry := rf.log.LastLogIndex
 		rf.commitIndex = minInteger(args.LeaderCommit, index_of_last_new_entry)
-		//Debug(dCommit, "S%v[follower] commitIndex %d", rf.me, rf.commitIndex)
 		rf.applyCond.Broadcast()
 	}
 	reply.Success = true
@@ -122,6 +121,17 @@ func (rf *Raft) logReplication() {
 		go rf.sendEntry(i)
 	}
 }
+func (rf *Raft) getLogTerm(index int) int {
+	// index 可能会越过FirstLogIndex
+	if rf.log.FirstLogIndex <= index && index <= rf.log.LastLogIndex {
+		return rf.log.get(index).Term
+	}
+	if index == rf.snapLastLogIndex {
+		return rf.snapLastLogTerm
+	}
+	Debug(dWarn, "S%v can't find Term for index%v", rf.me, index)
+	return -1
+}
 func (rf *Raft) sendEntry(targetServerId int) {
 	rf.mu.Lock()
 	if rf.state != leader {
@@ -134,7 +144,7 @@ func (rf *Raft) sendEntry(targetServerId int) {
 		LeaderId:     rf.me,
 		LeaderCommit: rf.commitIndex,
 		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  rf.log.get(prevLogIndex).Term,
+		PrevLogTerm:  rf.getLogTerm(prevLogIndex),
 		Entries:      rf.log.getAfter(prevLogIndex + 1),
 	}
 	rf.mu.Unlock()
@@ -164,49 +174,53 @@ func (rf *Raft) sendEntry(targetServerId int) {
 		}
 		return
 	}
-	if !reply.Success {
-		if reply.Xterm == -1 {
-			rf.nextIndex[targetServerId] = reply.Xlen
-		} else {
-			// 往后退找到任期为XTerm的第一条日志
-			pos := args.PrevLogIndex
-			for pos >= rf.log.FirstLogIndex && rf.log.get(pos).Term > reply.Xterm {
-				pos--
-			}
-			if rf.log.get(pos).Term != reply.Xterm {
-				// 没有找到任期Xterm的日志
-				rf.nextIndex[targetServerId] = reply.Xindex
-			} else {
-				// 找到了任期Xterm的日志
-				rf.nextIndex[targetServerId] = pos + 1
-			}
+	if reply.Success {
+		match := args.PrevLogIndex + len(args.Entries)
+		next := match + 1
+		rf.matchIndex[targetServerId] = maxInteger(rf.matchIndex[targetServerId], match)
+		rf.nextIndex[targetServerId] = maxInteger(rf.nextIndex[targetServerId], next)
+
+		// leader 只能提交本任期内的日志
+		majorityIndex := getMajoritySameIndex(rf.matchIndex)
+		if rf.getLogTerm(majorityIndex) == rf.currentTerm && majorityIndex > rf.commitIndex {
+			rf.commitIndex = majorityIndex
+			Debug(dCommit, "S%d receive agree reply from S%d, commitIndex %v", args.LeaderId, targetServerId, rf.commitIndex)
+			rf.applyCond.Broadcast()
 		}
-		//if rf.nextIndex[targetServerId] <= 0 {
-		//	Debug(dWarn, "S%v, log is%v,nextIndex is %v, tS is %v, reply is %v, args.Term %v, currentTerm %v", rf.me, rf.log, rf.nextIndex, targetServerId, reply, args.Term, rf.currentTerm)
-		//}
 		if len(args.Entries) == 0 {
-			Debug(dTimer, "S%d receive disagree HeartMsg reply from S%d", args.LeaderId, targetServerId)
+			Debug(dTimer, "S%d receive agree HeartMsg reply from S%d", args.LeaderId, targetServerId)
 		} else {
-			Debug(dLeader, "S%d receive disagree AEMsg reply from S%d", args.LeaderId, targetServerId)
+			Debug(dLeader, "S%d receive agree AEMsg reply from S%d", args.LeaderId, targetServerId)
 		}
 		return
 	}
-	// reply == success （考虑旧RPC比新RPC先到的场景）
-	match := args.PrevLogIndex + len(args.Entries)
-	next := match + 1
-	rf.matchIndex[targetServerId] = maxInteger(rf.matchIndex[targetServerId], match)
-	rf.nextIndex[targetServerId] = maxInteger(rf.nextIndex[targetServerId], next)
-
-	// leader 只能提交本任期内的日志
-	majorityIndex := getMajoritySameIndex(rf.matchIndex)
-	if rf.log.get(majorityIndex).Term == rf.currentTerm && majorityIndex > rf.commitIndex {
-		rf.commitIndex = majorityIndex
-		rf.applyCond.Broadcast()
+	// reply.Success == flase
+	if reply.Xterm == -1 {
+		rf.nextIndex[targetServerId] = reply.Xlen
+	} else {
+		// 往后退找到任期为XTerm的第一条日志（可能需要越过snapshot)
+		pos := args.PrevLogIndex
+		for pos >= rf.snapLastLogIndex && rf.log.get(pos).Term > reply.Xterm {
+			pos--
+		}
+		if rf.log.get(pos).Term != reply.Xterm {
+			// 没有找到任期Xterm的日志
+			rf.nextIndex[targetServerId] = reply.Xindex
+		} else {
+			// 找到了任期Xterm的日志
+			rf.nextIndex[targetServerId] = pos + 1
+		}
+	}
+	// 判断是否越过了snapshot
+	if rf.nextIndex[targetServerId] <= rf.snapLastLogIndex {
+		rf.nextIndex[targetServerId] = rf.log.FirstLogIndex
+		Debug(dSnap, "S%d receive too shot log from S%d", args.LeaderId, targetServerId)
+		go rf.sendSnapshot(targetServerId)
 	}
 	if len(args.Entries) == 0 {
-		Debug(dTimer, "S%d receive agree HeartMsg reply from S%d", args.LeaderId, targetServerId)
+		Debug(dTimer, "S%d receive disagree HeartMsg reply from S%d", args.LeaderId, targetServerId)
 	} else {
-		Debug(dLeader, "S%d receive agree AEMsg reply from S%d", args.LeaderId, targetServerId)
+		Debug(dLeader, "S%d receive disagree AEMsg reply from S%d", args.LeaderId, targetServerId)
 	}
 	return
 }

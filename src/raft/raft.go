@@ -44,6 +44,9 @@ type Raft struct {
 	// 辅助变量
 	electionTimer Timer
 	pingTimer     Timer
+	// lab2D
+	snapLastLogIndex int
+	snapLastLogTerm  int
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -57,14 +60,19 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-func (rf *Raft) persist() {
+func (rf *Raft) getRaftState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.snapLastLogTerm)
+	e.Encode(rf.snapLastLogIndex)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	return raftstate
+}
+func (rf *Raft) persist() {
+	rf.persister.Save(rf.getRaftState(), nil)
 	Debug(dPersist, "S%v persist", rf.me)
 }
 
@@ -75,14 +83,36 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil ||
-		d.Decode(&rf.log) != nil {
+	if d.Decode(&rf.currentTerm) != nil ||
+		d.Decode(&rf.votedFor) != nil ||
+		d.Decode(&rf.log) != nil ||
+		d.Decode(&rf.snapLastLogIndex) != nil ||
+		d.Decode(&rf.snapLastLogIndex) != nil {
 		panic("decode wrong!")
 	}
+	rf.commitIndex = rf.snapLastLogIndex
+	rf.lastApplied = rf.snapLastLogIndex
+	if rf.state == leader {
+		for j, _ := range rf.peers {
+			rf.nextIndex[j] = rf.log.LastLogIndex + 1
+		}
+	}
+	Debug(dPersist, "S%v recover, log is %v", rf.me, rf.log)
 }
 
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.snapLastLogIndex {
+		Debug(dSnap, "S%v drop old snapshot %v <= %v", rf.me, index, rf.snapLastLogIndex)
+		return
+	}
+	// 截断log
+	rf.snapLastLogIndex = index
+	rf.snapLastLogTerm = rf.log.get(index).Term
+	rf.log.deleteBefore(index)
+	// persist
+	rf.persister.Save(rf.getRaftState(), snapshot)
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -168,13 +198,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.snapLastLogTerm = 0
+	rf.snapLastLogIndex = 0
+
 	rf.readPersist(persister.ReadRaftState())
-	rf.mu.Lock()
-	if rf.state == leader {
-		rf.becomeLeader()
-	}
-	Debug(dPersist, "S%v recover, log is %v", rf.me, rf.log)
-	rf.mu.Unlock()
 
 	rf.electionTimer.reset(getRandElectTimeout())
 	rf.pingTimer.reset(HEART_BEAT_INTERVAL)

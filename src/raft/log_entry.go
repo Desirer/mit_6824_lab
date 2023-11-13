@@ -11,15 +11,19 @@ type Log struct {
 	LastLogIndex  int //最后一条log对应的真实index
 }
 
+func (l *Log) clean() {
+	l.Entries = l.Entries[0:1]
+}
+
 func (l *Log) append(entry Entry) {
 	l.Entries = append(l.Entries, entry)
 	l.LastLogIndex = l.LastLogIndex + 1
 }
 
 func (l *Log) get(index int) Entry {
-	if index == 0 {
-		return Entry{Term: -1, Command: -1}
-	}
+	//if index == 0 { //initial state for bootstrap
+	//	return Entry{Term: -1, Command: -1}
+	//}
 	return l.Entries[index-l.FirstLogIndex]
 }
 

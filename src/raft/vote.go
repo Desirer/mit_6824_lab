@@ -37,7 +37,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
 	}
-	if up_to_date(rf.log.get(rf.log.LastLogIndex).Term, rf.log.LastLogIndex, args.LastLogTerm, args.LastLogIndex) {
+	if up_to_date(rf.getLogTerm(rf.log.LastLogIndex), rf.log.LastLogIndex, args.LastLogTerm, args.LastLogIndex) {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		Debug(dVote, "S%d deny VoteAsk from S%d, old log", rf.me, args.CandidateId)
@@ -66,7 +66,7 @@ func (rf *Raft) doElection() {
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: rf.log.LastLogIndex,
-		LastLogTerm:  rf.log.get(rf.log.LastLogIndex).Term,
+		LastLogTerm:  rf.getLogTerm(rf.log.LastLogIndex),
 	}
 	count := 1
 	rf.mu.Unlock()
