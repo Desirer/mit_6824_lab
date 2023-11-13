@@ -34,7 +34,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 	if len(args.Entries) == 0 {
 		Debug(dTimer, "S%d receive HeartMsg from S%d", rf.me, args.LeaderId)
 	} else {
@@ -56,49 +55,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.electionTimer.reset(getRandElectTimeout()) //收到current leader的消息就应该重新设置选举定时器
-	// 0、最后一条log的index比preLogIndex小
-	if len(rf.log)-1 < args.PrevLogIndex {
+
+	if rf.log.LastLogIndex < args.PrevLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		reply.Xterm = -1
-		reply.Xlen = len(rf.log)
+		reply.Xlen = rf.log.LastLogIndex + 1
 		reply.Xindex = -1
 		Debug(dLeader, "S%d deny AEMsg from S%d, short log, reply is %v", rf.me, args.LeaderId, reply)
 		return
 	}
-	// 1、最后一条log的index大于等于preLogIndex
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+	if rf.log.get(args.PrevLogIndex).Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		reply.Xterm = rf.log[args.PrevLogIndex].Term
-		reply.Xindex = 1
+		reply.Xterm = rf.log.get(args.PrevLogIndex).Term
+		reply.Xindex = rf.log.FirstLogIndex
 		// 找到Xterm任期的第一条log位置(Xterm的index为1的情况）
-		for idx := args.PrevLogIndex; idx >= 1; idx-- {
-			if rf.log[idx-1].Term != reply.Xterm {
+		for idx := args.PrevLogIndex; idx >= rf.log.FirstLogIndex; idx-- {
+			if rf.log.get(idx-1).Term != reply.Xterm {
 				reply.Xindex = idx
 				break
 			}
 		}
-		Debug(dLeader, "S%d deny AEMsg from S%d, mismatch log", rf.me, args.LeaderId)
+		Debug(dLeader, "S%d deny AEMsg from S%d, mismatch log, reply %v", rf.me, args.LeaderId, reply)
 		return
 	}
 	// append or overwrite Enries from leader
 	for offset, entry := range args.Entries {
-		index := args.PrevLogIndex + 1 + offset
-		if len(rf.log)-1 >= index && rf.log[index].Term != entry.Term {
-			rf.log = rf.log[:index] // conflict && truncate
+		idx := args.PrevLogIndex + 1 + offset
+		if rf.log.FirstLogIndex <= idx && idx <= rf.log.LastLogIndex &&
+			rf.log.get(idx).Term != entry.Term {
+			rf.log.deleteAfter(idx)
 		}
-		if len(rf.log)-1 >= index {
-			rf.log[index] = entry // overwrite
+		if rf.log.FirstLogIndex <= idx && idx <= rf.log.LastLogIndex {
+			rf.log.set(idx, entry)
 		} else {
-			rf.log = append(rf.log, entry) //append
+			rf.log.append(entry)
 		}
 	}
 
 	// 更新 commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		//index_of_last_new_entry := args.PrevLogIndex + len(args.Entries)
-		index_of_last_new_entry := len(rf.log) - 1
+		index_of_last_new_entry := rf.log.LastLogIndex
 		rf.commitIndex = minInteger(args.LeaderCommit, index_of_last_new_entry)
 		//Debug(dCommit, "S%v[follower] commitIndex %d", rf.me, rf.commitIndex)
 		rf.applyCond.Broadcast()
@@ -109,6 +109,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		Debug(dTimer, "S%d agree HeartMsg from S%d", rf.me, args.LeaderId)
 	} else {
 		Debug(dLeader, "S%d agree AEMsg from S%d, log is %v", rf.me, args.LeaderId, rf.log)
+		rf.persist() //减少persist的次数
 	}
 	return
 }
@@ -128,16 +129,13 @@ func (rf *Raft) sendEntry(targetServerId int) {
 		return
 	}
 	prevLogIndex := rf.nextIndex[targetServerId] - 1
-	if prevLogIndex == -1 {
-		Debug(dWarn, "S%v, nextIndex is %v", rf.me, rf.nextIndex)
-	}
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		LeaderCommit: rf.commitIndex,
 		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  rf.log[prevLogIndex].Term,
-		Entries:      rf.log[rf.nextIndex[targetServerId]:],
+		PrevLogTerm:  rf.log.get(prevLogIndex).Term,
+		Entries:      rf.log.getAfter(prevLogIndex + 1),
 	}
 	rf.mu.Unlock()
 	reply := AppendEntriesReply{}
@@ -172,10 +170,10 @@ func (rf *Raft) sendEntry(targetServerId int) {
 		} else {
 			// 往后退找到任期为XTerm的第一条日志
 			pos := args.PrevLogIndex
-			for pos >= 1 && rf.log[pos].Term > reply.Xterm {
+			for pos >= rf.log.FirstLogIndex && rf.log.get(pos).Term > reply.Xterm {
 				pos--
 			}
-			if rf.log[pos].Term != reply.Xterm {
+			if rf.log.get(pos).Term != reply.Xterm {
 				// 没有找到任期Xterm的日志
 				rf.nextIndex[targetServerId] = reply.Xindex
 			} else {
@@ -201,7 +199,7 @@ func (rf *Raft) sendEntry(targetServerId int) {
 
 	// leader 只能提交本任期内的日志
 	majorityIndex := getMajoritySameIndex(rf.matchIndex)
-	if rf.log[majorityIndex].Term == rf.currentTerm && majorityIndex > rf.commitIndex {
+	if rf.log.get(majorityIndex).Term == rf.currentTerm && majorityIndex > rf.commitIndex {
 		rf.commitIndex = majorityIndex
 		rf.applyCond.Broadcast()
 	}

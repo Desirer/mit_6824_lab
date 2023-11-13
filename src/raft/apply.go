@@ -23,7 +23,7 @@ func (rf *Raft) applyLoop() {
 			rf.lastApplied++
 			applyMsg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Command,
+				Command:      rf.log.get(rf.lastApplied).Command,
 				CommandIndex: rf.lastApplied,
 			}
 			rf.applyCh <- applyMsg

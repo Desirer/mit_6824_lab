@@ -18,11 +18,6 @@ const (
 	leader    = 3
 )
 
-type Entry struct {
-	Term    int
-	Command interface{}
-}
-
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -33,9 +28,10 @@ type Raft struct {
 	state       int
 	currentTerm int
 	votedFor    int
-	log         []Entry       //存储每条log
-	applyCh     chan ApplyMsg //用于提交entry
-	applyCond   *sync.Cond    // 条件变量，用于applyEntry协程
+	//log         []Entry       //存储每条log
+	log       *Log
+	applyCh   chan ApplyMsg //用于提交entry
+	applyCond *sync.Cond    // 条件变量，用于applyEntry协程
 
 	// volatile on each server
 	commitIndex int //已经提交的最大 log entry 的index
@@ -93,14 +89,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	state := rf.state
-	index := len(rf.log)
+	index := rf.log.LastLogIndex + 1
 	term := rf.currentTerm
 	if state != leader {
 		return index, term, false
 	}
 
-	rf.log = append(rf.log, Entry{term, command})
-	rf.matchIndex[rf.me] = len(rf.log) - 1
+	rf.log.append(Entry{term, command})
+	rf.matchIndex[rf.me] = rf.log.LastLogIndex
 	Debug(dCommit, "S%v append a command %v, log is %v", rf.me, command, rf.log)
 	rf.persist()
 
@@ -163,11 +159,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionTimer = Timer{}
 	rf.pingTimer = Timer{}
-	rf.log = make([]Entry, 0)
-	rf.log = append(rf.log, Entry{
-		Term:    -1,
-		Command: -1,
-	})
+	rf.log = &Log{
+		Entries:       make([]Entry, 0),
+		FirstLogIndex: 1,
+		LastLogIndex:  0,
+	}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
@@ -210,7 +206,7 @@ func (rf *Raft) becomeLeader() {
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for j, _ := range rf.peers {
-		rf.nextIndex[j] = len(rf.log)
+		rf.nextIndex[j] = rf.log.LastLogIndex + 1
 	}
 	//go rf.logReplication()
 	Debug(dLog, "S%d become leader,log is %v", rf.me, rf.log)

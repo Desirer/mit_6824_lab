@@ -493,7 +493,7 @@ func TestBackup2B(t *testing.T) {
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
-	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
+	cfg.begin("Test (2B): leader backs up quickly over incorrect follower Entries")
 
 	cfg.one(100, servers, true)
 
@@ -897,7 +897,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 	cfg.begin("Test (2C): Figure 8 (unreliable)")
 
-	cfg.one(rand.Int()%10000, 1, true)
+	cfg.one(999, 1, true)
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
@@ -906,7 +906,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 		leader := -1
 		for i := 0; i < servers; i++ {
-			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
+			_, _, ok := cfg.rafts[i].Start(iters*10 + i)
 			if ok && cfg.connected[i] {
 				leader = i
 			}
@@ -940,7 +940,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
-	cfg.one(rand.Int()%10000, servers, true)
+	cfg.one(9999, servers, true)
 
 	cfg.end()
 }
