@@ -1,7 +1,5 @@
 package raft
 
-import "time"
-
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -14,41 +12,34 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-//func (rf *Raft) applyLoop() {
-//	for {
-//		rf.mu.Lock()
-//		for !(rf.lastApplied < rf.commitIndex) {
-//			rf.applyCond.Wait()
-//		}
-//		// 逐条提交命令
-//		for rf.lastApplied < rf.commitIndex {
-//			rf.lastApplied++
-//			applyMsg := ApplyMsg{
-//				CommandValid: true,
-//				Command:      rf.log.get(rf.lastApplied).Command,
-//				CommandIndex: rf.lastApplied,
-//			}
-//			rf.applyCh <- applyMsg
-//			Debug(dCommit, "S%v commit index%v command%v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
-//		}
-//		rf.mu.Unlock()
-//	}
-//}
-
-func (rf *Raft) applyLoop() {
-	for {
+func (rf *Raft) applyBuffer() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for !rf.killed() {
+		for !(rf.lastApplied < rf.commitIndex) {
+			rf.applyCond.Wait()
+		}
+		// 逐条提交命令,保证顺序
 		for rf.lastApplied < rf.commitIndex {
-			rf.mu.Lock()
 			rf.lastApplied++
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log.get(rf.lastApplied).Command,
 				CommandIndex: rf.lastApplied,
 			}
-			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
-			Debug(dCommit, "S%v commit index%v command%v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
+			rf.applyBufferCh <- applyMsg
+			//Debug(dCommit, "S%v commit index%v command%v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
 		}
-		time.Sleep(1000 * time.Millisecond)
+	}
+}
+func (rf *Raft) applyLoop() {
+	for !rf.killed() {
+		msg := <-rf.applyBufferCh
+		rf.applyCh <- msg
+		if msg.CommandValid {
+			Debug(dCommit, "S%v commit index%v command%v", rf.me, msg.CommandIndex, msg.Command)
+		} else {
+			Debug(dCommit, "S%v commit SS index%v len%v", rf.me, msg.SnapshotIndex, len(msg.Snapshot))
+		}
 	}
 }

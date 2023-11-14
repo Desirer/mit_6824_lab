@@ -37,15 +37,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) == 0 {
 		Debug(dTimer, "S%d receive HeartMsg from S%d", rf.me, args.LeaderId)
 	} else {
-		Debug(dLeader, "S%d receive AEMsg from S%d", rf.me, args.LeaderId)
+		Debug(dLeader, "S%d receive AEMsg from S%d, %v", rf.me, args.LeaderId, args)
 	}
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		Debug(dLeader, "S%d deny AEMsg from S%d, old term", rf.me, args.LeaderId)
+		//Debug(dLeader, "S%d deny AEMsg from S%d, old term", rf.me, args.LeaderId)
 		return
 	}
-	//rf.becomeFollower(args.Term)
+
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
 	}
@@ -62,14 +62,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Xterm = -1
 		reply.Xlen = rf.log.LastLogIndex + 1
 		reply.Xindex = -1
-		Debug(dLeader, "S%d deny AEMsg from S%d, short log, reply is %v", rf.me, args.LeaderId, reply)
+		Debug(dLeader, "S%d deny AEMsg from S%d, short log, reply %v", rf.me, args.LeaderId, reply)
 		return
 	}
 
 	if rf.getLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		reply.Xterm = rf.log.get(args.PrevLogIndex).Term
+		reply.Xterm = rf.getLogTerm(args.PrevLogIndex)
 		reply.Xindex = rf.snapLastLogIndex //兜底
 		// 找到Xterm任期的第一条log位置(可能进行过快照）
 		for idx := args.PrevLogIndex; idx >= rf.log.FirstLogIndex; idx-- {
@@ -141,7 +141,7 @@ func (rf *Raft) sendEntry(targetServerId int) {
 	prevLogIndex := rf.nextIndex[targetServerId] - 1
 	if prevLogIndex < rf.snapLastLogIndex {
 		go rf.sendSnapshot(targetServerId)
-		Debug(dSnap, "S%v send SS to S%v, pLI %v sLLI %v", rf.me, targetServerId, prevLogIndex, rf.snapLastLogIndex)
+		Debug(dSnap, "S%v send SS to S%v, pLI %v", rf.me, targetServerId, prevLogIndex)
 		rf.mu.Unlock()
 		return
 	}
@@ -206,7 +206,7 @@ func (rf *Raft) sendEntry(targetServerId int) {
 	} else {
 		// 往后退找到任期为XTerm的第一条日志（可能需要越过snapshot)
 		pos := args.PrevLogIndex
-		for pos >= rf.snapLastLogIndex && rf.getLogTerm(pos) > reply.Xterm {
+		for pos > rf.snapLastLogIndex && rf.getLogTerm(pos) > reply.Xterm {
 			pos--
 		}
 		if rf.getLogTerm(pos) != reply.Xterm {
@@ -214,19 +214,13 @@ func (rf *Raft) sendEntry(targetServerId int) {
 			rf.nextIndex[targetServerId] = reply.Xindex
 		} else {
 			// 找到了任期Xterm的日志
-			rf.nextIndex[targetServerId] = pos + 1
+			rf.nextIndex[targetServerId] = pos
 		}
 	}
-	//// 判断是否越过了snapshot
-	//if rf.nextIndex[targetServerId] < rf.snapLastLogIndex {
-	//	rf.nextIndex[targetServerId] = rf.log.FirstLogIndex
-	//	Debug(dSnap, "S%d receive too shot log from S%d", args.LeaderId, targetServerId)
-	//	go rf.sendSnapshot(targetServerId)
-	//}
 	if len(args.Entries) == 0 {
-		Debug(dTimer, "S%d receive disagree HeartMsg reply from S%d", args.LeaderId, targetServerId)
+		Debug(dTimer, "S%d receive disagree HeartMsg reply from S%d, reply%v", args.LeaderId, targetServerId, reply)
 	} else {
-		Debug(dLeader, "S%d receive disagree AEMsg reply from S%d", args.LeaderId, targetServerId)
+		Debug(dLeader, "S%d receive disagree AEMsg reply from S%d, reply%v", args.LeaderId, targetServerId, reply)
 	}
 	return
 }

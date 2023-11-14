@@ -25,13 +25,13 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	state       int
-	currentTerm int
-	votedFor    int
-	//log         []Entry       //存储每条log
-	log       *Log
-	applyCh   chan ApplyMsg //用于提交entry
-	applyCond *sync.Cond    // 条件变量，用于applyEntry协程
+	state         int
+	currentTerm   int
+	votedFor      int
+	log           *Log
+	applyCh       chan ApplyMsg //用于提交entry
+	applyBufferCh chan ApplyMsg // 提交缓冲区
+	applyCond     *sync.Cond    // 条件变量，用于applyBuffer协程
 
 	// volatile on each server
 	commitIndex int //已经提交的最大 log entry 的index
@@ -66,8 +66,8 @@ func (rf *Raft) getRaftState() []byte {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	e.Encode(rf.snapLastLogTerm)
 	e.Encode(rf.snapLastLogIndex)
+	e.Encode(rf.snapLastLogTerm)
 	raftstate := w.Bytes()
 	return raftstate
 }
@@ -77,6 +77,8 @@ func (rf *Raft) persist() {
 }
 
 func (rf *Raft) readPersist(data []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		Debug(dWarn, "S%v read blank state", rf.me)
 		return
@@ -87,33 +89,17 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&rf.votedFor) != nil ||
 		d.Decode(&rf.log) != nil ||
 		d.Decode(&rf.snapLastLogIndex) != nil ||
-		d.Decode(&rf.snapLastLogIndex) != nil {
+		d.Decode(&rf.snapLastLogTerm) != nil {
 		panic("decode wrong!")
 	}
-	rf.commitIndex = rf.snapLastLogIndex
 	rf.lastApplied = rf.snapLastLogIndex
+	rf.commitIndex = rf.snapLastLogIndex
 	if rf.state == leader {
 		for j, _ := range rf.peers {
 			rf.nextIndex[j] = rf.log.LastLogIndex + 1
 		}
 	}
-	Debug(dPersist, "S%v recover, log is %v", rf.me, rf.log)
-}
-
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if index <= rf.snapLastLogIndex {
-		Debug(dSnap, "S%v drop old SS %v <= %v", rf.me, index, rf.snapLastLogIndex)
-		return
-	}
-	// 截断log
-	rf.snapLastLogIndex = index
-	rf.snapLastLogTerm = rf.log.get(index).Term
-	rf.log.deleteBefore(index)
-	// persist
-	rf.persister.Save(rf.getRaftState(), snapshot)
-	Debug(dSnap, "S%v make SS,sLI %v len(SS) %v", rf.me, rf.snapLastLogIndex, rf.persister.SnapshotSize())
+	Debug(dPersist, "S%v recover, log is %v, sLLI%v sLLT%v ", rf.me, rf.log, rf.snapLastLogIndex, rf.snapLastLogTerm)
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -198,6 +184,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
+	rf.applyBufferCh = make(chan ApplyMsg, 200)
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.snapLastLogTerm = 0
 	rf.snapLastLogIndex = 0
@@ -208,6 +195,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.pingTimer.reset(HEART_BEAT_INTERVAL)
 	go rf.ticker()
 	go rf.applyLoop()
+	go rf.applyBuffer()
 
 	return rf
 }

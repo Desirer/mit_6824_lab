@@ -1,5 +1,21 @@
 package raft
 
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.snapLastLogIndex {
+		Debug(dSnap, "S%v drop old SS %v <= %v", rf.me, index, rf.snapLastLogIndex)
+		return
+	}
+	// 截断log
+	rf.snapLastLogIndex = index
+	rf.snapLastLogTerm = rf.log.get(index).Term
+	rf.log.deleteBefore(index)
+	// persist
+	rf.persister.Save(rf.getRaftState(), snapshot)
+	Debug(dSnap, "S%v make SS,sLI %v len(SS) %v log %v", rf.me, rf.snapLastLogIndex, rf.persister.SnapshotSize(), rf.log)
+}
+
 type InstallSnapshotArgs struct {
 	Term              int
 	LeaderId          int
@@ -9,12 +25,11 @@ type InstallSnapshotArgs struct {
 }
 
 type InstallSnapshotReply struct {
-	Term    int
-	Success bool
+	Term int
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	Debug(dSnap, "S%d send SS to S%d, LII %v len(SS) %v", args.LeaderId, server, args.LastIncludedIndex, len(args.Data))
+	Debug(dSnap, "S%d send SS to S%d, LII %v", args.LeaderId, server, args.LastIncludedIndex)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
@@ -25,54 +40,42 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	Debug(dSnap, "S%d receive SS request fromS%d", rf.me, args.LeaderId)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		reply.Success = false
 		Debug(dSnap, "S%d deny SS request fromS%d, old term", rf.me, args.LeaderId)
 		return
 	}
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
 	}
+	rf.electionTimer.reset(getRandElectTimeout())
+	if rf.state == candidate {
+		rf.state = follower
+	}
 	if args.LastIncludedIndex <= rf.snapLastLogIndex {
 		reply.Term = rf.currentTerm
-		reply.Success = false
-		Debug(dSnap, "S%d deny SS request fromS%d, old snapshot", rf.me, args.LeaderId)
+		Debug(dSnap, "S%d deny SS request fromS%d, old snapshot, lII%v <= sLLI%v", rf.me, args.LeaderId, args.LastIncludedIndex, rf.snapLastLogIndex)
 		return
 	}
-	// 收到有效镜像，全部重置StateMachine的状态(not good enough)
 	rf.snapLastLogTerm = args.LastIncludedTerm
 	rf.snapLastLogIndex = args.LastIncludedIndex
-	rf.lastApplied = args.LastIncludedIndex
-	rf.commitIndex = args.LastIncludedIndex
-	//if rf.lastApplied < args.LastIncludedIndex {
-	//	rf.lastApplied = args.LastIncludedIndex
-	//}
-	//if rf.commitIndex < args.LastIncludedIndex {
-	//	rf.commitIndex = args.LastIncludedIndex
-	//}
-	// 1、snapshot太超前，舍弃现有的所有log
-	if args.LastIncludedIndex >= rf.log.LastLogIndex {
-		rf.log.clean()
-		rf.log.FirstLogIndex = args.LastIncludedIndex + 1
-		rf.log.LastLogIndex = args.LastIncludedIndex
-		rf.persister.Save(rf.getRaftState(), args.Data)
-		rf.applySnapshot(args)
-
-		reply.Term = rf.currentTerm
-		reply.Success = true
+	if args.LastIncludedIndex > rf.log.LastLogIndex {
+		// 1、snapshot太超前，舍弃现有的所有log
+		rf.log.clean(args.LastIncludedIndex)
 		Debug(dSnap, "S%d accept SS fromS%d,discard origin log %v", rf.me, args.LeaderId, rf.log)
-		return
-	}
-	// 2、snapshot超过旧镜像，低于lastLogIndex, 截断部分log
-	if rf.log.FirstLogIndex < args.LastIncludedIndex {
+	} else {
+		// 2、firstIncludeIndex <= args.LastInculdeIndex <= lastLogIndex
 		rf.log.deleteBefore(args.LastIncludedIndex)
-		rf.persister.Save(rf.getRaftState(), args.Data)
-		rf.applySnapshot(args)
-
-		reply.Term = rf.currentTerm
-		reply.Success = true
 		Debug(dSnap, "S%d accept SS fromS%d,truncate log %v", rf.me, args.LeaderId, rf.log)
-		return
 	}
+	// 快照包含了越前的状态，直接应用
+	if args.LastIncludedIndex > rf.lastApplied {
+		rf.lastApplied = args.LastIncludedIndex
+		rf.commitIndex = maxInteger(rf.commitIndex, args.LastIncludedIndex)
+		rf.applySnapshot(args)
+	}
+	// 否则只需保存快照
+	rf.persister.Save(rf.getRaftState(), args.Data)
+	reply.Term = rf.currentTerm
+	return
 }
 func (rf *Raft) applySnapshot(args *InstallSnapshotArgs) {
 	applyMag := ApplyMsg{
@@ -81,8 +84,8 @@ func (rf *Raft) applySnapshot(args *InstallSnapshotArgs) {
 		SnapshotTerm:  args.LastIncludedTerm,
 		Snapshot:      args.Data,
 	}
-	rf.applyCh <- applyMag
-	Debug(dSnap, "S%d apply SS,len%v", rf.me, len(args.Data))
+	rf.applyBufferCh <- applyMag
+	//Debug(dSnap, "S%d apply SS,len%v", rf.me, len(args.Data))
 }
 
 func (rf *Raft) sendSnapshot(targetServerId int) {
@@ -115,12 +118,8 @@ func (rf *Raft) sendSnapshot(targetServerId int) {
 	if rf.state != leader || args.Term != rf.currentTerm {
 		return
 	}
-	if !reply.Success {
-		Debug(dSnap, "S%v receive deny SS Reply from S%v, matchIndex %v", rf.me, targetServerId, rf.matchIndex)
-		return
-	}
 	rf.nextIndex[targetServerId] = maxInteger(rf.nextIndex[targetServerId], args.LastIncludedIndex+1)
 	rf.matchIndex[targetServerId] = maxInteger(rf.matchIndex[targetServerId], args.LastIncludedIndex)
-	Debug(dSnap, "S%v receive agree SS Reply from S%v, matchIndex %v", rf.me, targetServerId, rf.matchIndex)
+	Debug(dSnap, "S%v receive SS Reply from S%v, matchIndex %v, nextIndex%v", rf.me, targetServerId, rf.matchIndex, rf.nextIndex)
 	return
 }

@@ -11,8 +11,10 @@ type Log struct {
 	LastLogIndex  int //最后一条log对应的真实index
 }
 
-func (l *Log) clean() {
-	l.Entries = l.Entries[:0]
+func (l *Log) clean(lastLogIndex int) {
+	l.Entries = make([]Entry, 0)
+	l.FirstLogIndex = lastLogIndex + 1
+	l.LastLogIndex = lastLogIndex
 }
 
 func (l *Log) append(entry Entry) {
