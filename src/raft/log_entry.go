@@ -12,7 +12,7 @@ type Log struct {
 }
 
 func (l *Log) clean() {
-	l.Entries = l.Entries[0:1]
+	l.Entries = l.Entries[:0]
 }
 
 func (l *Log) append(entry Entry) {

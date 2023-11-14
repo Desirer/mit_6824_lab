@@ -9,11 +9,12 @@ type InstallSnapshotArgs struct {
 }
 
 type InstallSnapshotReply struct {
-	Term int
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	Debug(dSnap, "S%d send snapshot to S%d", args.LeaderId, server)
+	Debug(dSnap, "S%d send SS to S%d, LII %v len(SS) %v", args.LeaderId, server, args.LastIncludedIndex, len(args.Data))
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
@@ -21,10 +22,11 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debug(dSnap, "S%d receive snapshot request fromS%d", rf.me, args.LeaderId)
+	Debug(dSnap, "S%d receive SS request fromS%d", rf.me, args.LeaderId)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		Debug(dSnap, "S%d deny snapshot request fromS%d, old term", rf.me, args.LeaderId)
+		reply.Success = false
+		Debug(dSnap, "S%d deny SS request fromS%d, old term", rf.me, args.LeaderId)
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -32,7 +34,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	if args.LastIncludedIndex <= rf.snapLastLogIndex {
 		reply.Term = rf.currentTerm
-		Debug(dSnap, "S%d deny snapshot request fromS%d, old snapshot", rf.me, args.LeaderId)
+		reply.Success = false
+		Debug(dSnap, "S%d deny SS request fromS%d, old snapshot", rf.me, args.LeaderId)
 		return
 	}
 	// 收到有效镜像，全部重置StateMachine的状态(not good enough)
@@ -55,7 +58,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.applySnapshot(args)
 
 		reply.Term = rf.currentTerm
-		Debug(dSnap, "S%d accept snapshot fromS%d, too fast && discard origin log", rf.me, args.LeaderId)
+		reply.Success = true
+		Debug(dSnap, "S%d accept SS fromS%d,discard origin log %v", rf.me, args.LeaderId, rf.log)
 		return
 	}
 	// 2、snapshot超过旧镜像，低于lastLogIndex, 截断部分log
@@ -65,7 +69,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.applySnapshot(args)
 
 		reply.Term = rf.currentTerm
-		Debug(dSnap, "S%d accept snapshot fromS%d, mid && truncate log", rf.me, args.LeaderId)
+		reply.Success = true
+		Debug(dSnap, "S%d accept SS fromS%d,truncate log %v", rf.me, args.LeaderId, rf.log)
 		return
 	}
 }
@@ -77,7 +82,7 @@ func (rf *Raft) applySnapshot(args *InstallSnapshotArgs) {
 		Snapshot:      args.Data,
 	}
 	rf.applyCh <- applyMag
-	Debug(dSnap, "S%d apply an snapshot", rf.me)
+	Debug(dSnap, "S%d apply SS,len%v", rf.me, len(args.Data))
 }
 
 func (rf *Raft) sendSnapshot(targetServerId int) {
@@ -88,6 +93,7 @@ func (rf *Raft) sendSnapshot(targetServerId int) {
 	}
 	args := &InstallSnapshotArgs{
 		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
 		LastIncludedIndex: rf.snapLastLogIndex,
 		LastIncludedTerm:  rf.snapLastLogTerm,
 		Data:              rf.persister.ReadSnapshot(),
@@ -101,11 +107,20 @@ func (rf *Raft) sendSnapshot(targetServerId int) {
 		Debug(dSnap, "S%v can't send snapshot to S%v", rf.me, targetServerId)
 		return
 	}
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollower(reply.Term)
+		Debug(dLog, "S%v become follower ", rf.me)
+		return
+	}
 	if rf.state != leader || args.Term != rf.currentTerm {
 		return
 	}
+	if !reply.Success {
+		Debug(dSnap, "S%v receive deny SS Reply from S%v, matchIndex %v", rf.me, targetServerId, rf.matchIndex)
+		return
+	}
 	rf.nextIndex[targetServerId] = maxInteger(rf.nextIndex[targetServerId], args.LastIncludedIndex+1)
-	rf.matchIndex[targetServerId] = maxInteger(rf.nextIndex[targetServerId], args.LastIncludedIndex)
-	Debug(dSnap, "S%v receive snapshot Reply from S%v", rf.me, targetServerId)
+	rf.matchIndex[targetServerId] = maxInteger(rf.matchIndex[targetServerId], args.LastIncludedIndex)
+	Debug(dSnap, "S%v receive agree SS Reply from S%v, matchIndex %v", rf.me, targetServerId, rf.matchIndex)
 	return
 }

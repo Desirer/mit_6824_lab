@@ -72,8 +72,8 @@ func (rf *Raft) getRaftState() []byte {
 	return raftstate
 }
 func (rf *Raft) persist() {
-	rf.persister.Save(rf.getRaftState(), nil)
-	Debug(dPersist, "S%v persist", rf.me)
+	rf.persister.SaveRaftState(rf.getRaftState())
+	//Debug(dPersist, "S%v persist", rf.me)
 }
 
 func (rf *Raft) readPersist(data []byte) {
@@ -104,7 +104,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if index <= rf.snapLastLogIndex {
-		Debug(dSnap, "S%v drop old snapshot %v <= %v", rf.me, index, rf.snapLastLogIndex)
+		Debug(dSnap, "S%v drop old SS %v <= %v", rf.me, index, rf.snapLastLogIndex)
 		return
 	}
 	// 截断log
@@ -113,6 +113,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.log.deleteBefore(index)
 	// persist
 	rf.persister.Save(rf.getRaftState(), snapshot)
+	Debug(dSnap, "S%v make SS,sLI %v len(SS) %v", rf.me, rf.snapLastLogIndex, rf.persister.SnapshotSize())
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {

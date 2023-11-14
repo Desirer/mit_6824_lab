@@ -129,7 +129,7 @@ func (rf *Raft) getLogTerm(index int) int {
 	if index == rf.snapLastLogIndex {
 		return rf.snapLastLogTerm
 	}
-	Debug(dWarn, "S%v can't find Term for index%v", rf.me, index)
+	//Debug(dWarn, "S%v can't find Term for index%v", rf.me, index)
 	return -1
 }
 func (rf *Raft) sendEntry(targetServerId int) {
@@ -139,6 +139,12 @@ func (rf *Raft) sendEntry(targetServerId int) {
 		return
 	}
 	prevLogIndex := rf.nextIndex[targetServerId] - 1
+	if prevLogIndex < rf.snapLastLogIndex {
+		go rf.sendSnapshot(targetServerId)
+		Debug(dSnap, "S%v send SS to S%v, pLI %v sLLI %v", rf.me, targetServerId, prevLogIndex, rf.snapLastLogIndex)
+		rf.mu.Unlock()
+		return
+	}
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -184,7 +190,7 @@ func (rf *Raft) sendEntry(targetServerId int) {
 		majorityIndex := getMajoritySameIndex(rf.matchIndex)
 		if rf.getLogTerm(majorityIndex) == rf.currentTerm && majorityIndex > rf.commitIndex {
 			rf.commitIndex = majorityIndex
-			Debug(dCommit, "S%d receive agree reply from S%d, commitIndex %v", args.LeaderId, targetServerId, rf.commitIndex)
+			Debug(dCommit, "S%d receive agree reply from S%d, commitIndex %v, matchedIndex %v", args.LeaderId, targetServerId, rf.commitIndex, rf.matchIndex)
 			rf.applyCond.Broadcast()
 		}
 		if len(args.Entries) == 0 {
@@ -200,10 +206,10 @@ func (rf *Raft) sendEntry(targetServerId int) {
 	} else {
 		// 往后退找到任期为XTerm的第一条日志（可能需要越过snapshot)
 		pos := args.PrevLogIndex
-		for pos >= rf.snapLastLogIndex && rf.log.get(pos).Term > reply.Xterm {
+		for pos >= rf.snapLastLogIndex && rf.getLogTerm(pos) > reply.Xterm {
 			pos--
 		}
-		if rf.log.get(pos).Term != reply.Xterm {
+		if rf.getLogTerm(pos) != reply.Xterm {
 			// 没有找到任期Xterm的日志
 			rf.nextIndex[targetServerId] = reply.Xindex
 		} else {
@@ -211,12 +217,12 @@ func (rf *Raft) sendEntry(targetServerId int) {
 			rf.nextIndex[targetServerId] = pos + 1
 		}
 	}
-	// 判断是否越过了snapshot
-	if rf.nextIndex[targetServerId] <= rf.snapLastLogIndex {
-		rf.nextIndex[targetServerId] = rf.log.FirstLogIndex
-		Debug(dSnap, "S%d receive too shot log from S%d", args.LeaderId, targetServerId)
-		go rf.sendSnapshot(targetServerId)
-	}
+	//// 判断是否越过了snapshot
+	//if rf.nextIndex[targetServerId] < rf.snapLastLogIndex {
+	//	rf.nextIndex[targetServerId] = rf.log.FirstLogIndex
+	//	Debug(dSnap, "S%d receive too shot log from S%d", args.LeaderId, targetServerId)
+	//	go rf.sendSnapshot(targetServerId)
+	//}
 	if len(args.Entries) == 0 {
 		Debug(dTimer, "S%d receive disagree HeartMsg reply from S%d", args.LeaderId, targetServerId)
 	} else {
