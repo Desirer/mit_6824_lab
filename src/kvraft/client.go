@@ -4,10 +4,11 @@ import "6.5840/labrpc"
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	servers   []*labrpc.ClientEnd
+	leaderId  int64
+	clientId  int64
+	commandId int64
 }
 
 func nrand() int64 {
@@ -20,41 +21,31 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.leaderId = 0
+	ck.clientId = nrand() //采用随机数生成id，有微小几率重复
+	ck.commandId = 0
 	return ck
 }
 
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
-}
-
-// shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	return ck.CommandExecutor(&CommandRequest{Operation: GET, Key: key})
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.CommandExecutor(&CommandRequest{Operation: PUT, Key: key, Value: value})
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.CommandExecutor(&CommandRequest{Operation: APPEND, Key: key, Value: value})
+}
+func (ck *Clerk) CommandExecutor(request *CommandRequest) string {
+	request.ClientId, request.CommandId = ck.clientId, ck.commandId
+	for {
+		var response CommandResponse
+		if !ck.servers[ck.leaderId].Call("KVServer.HandleRequest", request, &response) || response.Err == ErrWrongLeader || response.Err == ErrTimeout {
+			ck.leaderId = (ck.leaderId + 1) % int64(len(ck.servers))
+			continue
+		}
+		ck.commandId++ // commandId不断递增
+		return response.Value
+	}
 }

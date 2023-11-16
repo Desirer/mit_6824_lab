@@ -4,6 +4,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -26,6 +27,7 @@ func (rf *Raft) applyBuffer() {
 				CommandValid: true,
 				Command:      rf.log.get(rf.lastApplied).Command,
 				CommandIndex: rf.lastApplied,
+				CommandTerm:  rf.log.get(rf.lastApplied).Term,
 			}
 			rf.applyBufferCh <- applyMsg
 			//Debug(dCommit, "S%v commit index%v command%v", rf.me, applyMsg.CommandIndex, applyMsg.Command)
