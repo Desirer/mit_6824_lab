@@ -1,91 +1,116 @@
 package raft
 
-// Debugging
-//const Debug = false
-//
-//func DPrintf(format string, a ...interface{}) (n int, err error) {
-//	if Debug {
-//		log.Printf(format, a...)
-//	}
-//	return
-//}
-
 import (
-	"fmt"
 	"log"
-	"os"
-	"strconv"
-	"time"
+	"sync"
+	"sync/atomic"
 )
 
-/*
-borrowed code from https://blog.josejg.com/debugging-pretty/
-*/
+// Debugging
+const Debug_level = 9911111
 
-var debugStart time.Time
-var debugVerbosity int
-
-type logTopic string
-
-const (
-	dClient  logTopic = "CLNT"
-	dCommit  logTopic = "CMIT"
-	dDrop    logTopic = "DROP"
-	dError   logTopic = "ERRO"
-	dInfo    logTopic = "INFO"
-	dLeader  logTopic = "LEAD"
-	dLog     logTopic = "LOG1"
-	dLog2    logTopic = "LOG2"
-	dPersist logTopic = "PERS"
-	dSnap    logTopic = "SNAP"
-	dTerm    logTopic = "TERM"
-	dTest    logTopic = "TEST"
-	dTimer   logTopic = "TIMR"
-	dTrace   logTopic = "TRCE"
-	dVote    logTopic = "VOTE"
-	dWarn    logTopic = "WARN"
-)
-
-func getVerbosity() int {
-	v := os.Getenv("VERBOSE")
-	level := 0
-	if v != "" {
-		var err error
-		level, err = strconv.Atoi(v)
-		if err != nil {
-			log.Fatalf("Invalid verbosity %v", v)
-		}
-	}
-	return level
-}
-
-func init() {
-	// init()函数是一个特殊的函数，它在程序启动时自动执行，且先于Main函数执行
-	debugVerbosity = getVerbosity()
-	debugStart = time.Now()
-
-	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
-}
-
-func Debug(topic logTopic, format string, a ...interface{}) {
-	if debugVerbosity > 0 {
-		time := time.Since(debugStart).Microseconds()
-		time /= 100
-		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
-		format = prefix + format
+func DPrintf(level int, format string, a ...interface{}) (n int, err error) {
+	if Debug_level <= level {
 		log.Printf(format, a...)
 	}
+	return
 }
 
-func minInteger(a int, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-func maxInteger(a int, b int) int {
+func max(a, b int) int {
 	if a > b {
 		return a
+	} else {
+		return b
 	}
-	return b
+}
+func min(a, b int) int {
+	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+func ifCond(cond bool, a, b interface{}) interface{} {
+	if cond {
+		return a
+	} else {
+		return b
+	}
+}
+func getcount() func() int {
+	cnt := 1000
+	return func() int {
+		cnt++
+		return cnt
+	}
+}
+
+type ApplyHelper struct {
+	applyCh       chan ApplyMsg
+	lastItemIndex int
+	q             []ApplyMsg
+	mu            sync.Mutex
+	cond          *sync.Cond
+	dead          int32
+}
+
+func NewApplyHelper(applyCh chan ApplyMsg, lastApplied int) *ApplyHelper {
+	applyHelper := &ApplyHelper{
+		applyCh:       applyCh,
+		lastItemIndex: lastApplied,
+		q:             make([]ApplyMsg, 0),
+	}
+	applyHelper.cond = sync.NewCond(&applyHelper.mu)
+	go applyHelper.applier()
+	return applyHelper
+}
+func (applyHelper *ApplyHelper) Kill() {
+	atomic.StoreInt32(&applyHelper.dead, 1)
+}
+func (applyHelper *ApplyHelper) killed() bool {
+	z := atomic.LoadInt32(&applyHelper.dead)
+	return z == 1
+}
+func (applyHelper *ApplyHelper) applier() {
+	for !applyHelper.killed() {
+		applyHelper.mu.Lock()
+		if len(applyHelper.q) == 0 {
+			applyHelper.cond.Wait()
+		}
+		msg := applyHelper.q[0]
+		applyHelper.q = applyHelper.q[1:]
+		applyHelper.mu.Unlock()
+		DPrintf(8000, "applyhelper start apply msg index=%v", ifCond(msg.CommandValid, msg.CommandIndex, msg.SnapshotIndex))
+		applyHelper.applyCh <- msg
+		//<-applyHelper.applyCh
+		DPrintf(8000, "applyhelper done apply msg index=%v with log entry： %v", ifCond(msg.CommandValid, msg.CommandIndex, msg.SnapshotIndex), msg.Command)
+	}
+}
+func (applyHelper *ApplyHelper) tryApply(msg *ApplyMsg) bool {
+	applyHelper.mu.Lock()
+	defer applyHelper.mu.Unlock()
+	DPrintf(100, "applyhelper get msg index=%v", ifCond(msg.CommandValid, msg.CommandIndex, msg.SnapshotIndex))
+	if msg.CommandValid {
+		if msg.CommandIndex <= applyHelper.lastItemIndex {
+			return true
+		}
+		if msg.CommandIndex == applyHelper.lastItemIndex+1 {
+			applyHelper.q = append(applyHelper.q, *msg)
+			applyHelper.lastItemIndex++
+			applyHelper.cond.Broadcast()
+			return true
+		}
+		panic("applyhelper meet false")
+		return false
+	} else if msg.SnapshotValid {
+		if msg.SnapshotIndex <= applyHelper.lastItemIndex {
+			return true
+		}
+		applyHelper.q = append(applyHelper.q, *msg)
+		applyHelper.lastItemIndex = msg.SnapshotIndex
+		applyHelper.cond.Broadcast()
+		return true
+	} else {
+		panic("applyHelper meet both invalid")
+	}
 }

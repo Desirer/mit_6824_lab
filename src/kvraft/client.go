@@ -1,6 +1,8 @@
 package kvraft
 
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+)
 import "crypto/rand"
 import "math/big"
 
@@ -41,10 +43,14 @@ func (ck *Clerk) CommandExecutor(request *CommandRequest) string {
 	request.ClientId, request.CommandId = ck.clientId, ck.commandId
 	for {
 		var response CommandResponse
+		//DPrintf("C[%v] send %v request toS[%v]", ck.clientId, request.Operation, ck.leaderId)
 		if !ck.servers[ck.leaderId].Call("KVServer.HandleRequest", request, &response) || response.Err == ErrWrongLeader || response.Err == ErrTimeout {
+			DPrintf("C[%v][%v] receive response from S[%v], ERR %v", ck.clientId, ck.commandId, ck.leaderId, response.Err)
 			ck.leaderId = (ck.leaderId + 1) % int64(len(ck.servers))
+			//time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		//DPrintf("C[%v][%v] receive response from S[%v], ERR %v", ck.clientId,ck.commandId, ck.leaderId, response.Err)
 		ck.commandId++ // commandId不断递增
 		return response.Value
 	}

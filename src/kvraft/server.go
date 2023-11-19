@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,28 +17,20 @@ type Op struct {
 	Key       string
 	Value     string
 }
-type IndexTerm struct {
-	index int
-	term  int
-}
-
-//	type Identify struct {
-//		clientId int
-//		commandId int
-//	}
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
+	persister *raft.Persister
+	applyCh   chan raft.ApplyMsg
+	dead      int32 // set by Kill()
 
-	maxRaftState int                                // snapshot if log grows this big
-	kvStore      map[string]string                  // data store
-	clientMap    map[int64]int64                    // 维护每个client处理的最新命令
-	channelMap   map[IndexTerm]chan CommandResponse // for synchronize, waiting apply
-	//resultMap map[Identify] CommandResponse
+	maxraftstate int // snapshot if log grows this big
+	lastApplied  int
+	kvStore      map[string]string            // data store
+	clientMap    map[int64]int64              // 维护每个client处理的最新命令
+	channelMap   map[int]chan CommandResponse // for synchronize, waiting apply
 }
 
 func (kv *KVServer) Kill() {
@@ -51,82 +44,153 @@ func (kv *KVServer) killed() bool {
 }
 
 func (kv *KVServer) HandleRequest(request *CommandRequest, response *CommandResponse) {
-	if kv.killed() {
-		response.Err = ErrWrongLeader
-		return
-	}
-	_, leader := kv.rf.GetState()
-	if !leader {
-		response.Err = ErrWrongLeader
-		return
-	}
-
+	DPrintf("S[%v] receive req C[%v][%v], op %v, key%v, val%v ", kv.me, request.ClientId, request.CommandId, request.Operation, request.Key, request.Value)
 	op := Op{Operation: request.Operation, ClientId: request.ClientId, CommandId: request.CommandId, Key: request.Key, Value: request.Value}
-	index, term, _ := kv.rf.Start(op)
-	synCh := kv.getSynChannel(IndexTerm{index: index, term: term})
-	// todo 回收管道
+	kv.mu.Lock()
+	if request.Operation != GET && kv.isDuplicate(&op) {
+		response.Err = OK
+		DPrintf("S[%v] reply C[%v][%v], duplicated", kv.me, request.ClientId, request.CommandId)
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
 
-	timer := time.NewTicker(100 * time.Millisecond)
-	defer timer.Stop()
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		response.Err = ErrWrongLeader
+		DPrintf("S[%v] deny req C[%v][%v], wrong leader", kv.me, request.ClientId, request.CommandId)
+		return
+	}
+
+	kv.mu.Lock()
+	//DPrintf("S[%v] receive C[%v][%v], here2", kv.me, request.ClientId, request.CommandId)
+	DPrintf("S[%v] receive C[%v][%v], here2, %v", kv.me, request.ClientId, request.CommandId, index)
+	synCh := kv.getSynChannel(index)
+	kv.mu.Unlock()
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.channelMap, index) //删除键值对，由垃圾回收算法释放管道
+		kv.mu.Unlock()
+	}()
 
 	select {
 	case result := <-synCh:
+		DPrintf("S[%v] reply C[%v][%v], here5", kv.me, request.ClientId, request.CommandId)
 		response.Err = result.Err
-		if result.Err == OK {
-			response.Value = result.Value
-			return
-		}
-	case <-timer.C:
+		response.Value = result.Value
+		return
+	case <-time.After(500 * time.Millisecond):
 		response.Err = ErrTimeout
+		DPrintf("S[%v] reply C[%v][%v], timeout", kv.me, request.ClientId, request.CommandId)
 		return
 	}
 }
-func (kv *KVServer) getSynChannel(key IndexTerm) chan CommandResponse {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+func (kv *KVServer) getSynChannel(key int) chan CommandResponse {
 	ch, exist := kv.channelMap[key]
 	if !exist {
-		kv.channelMap[key] = make(chan CommandResponse)
+		kv.channelMap[key] = make(chan CommandResponse, 1) // 1大小缓冲区十分重要
 		ch = kv.channelMap[key]
 	}
 	return ch
 }
 
 func (kv *KVServer) isDuplicate(op *Op) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	commandId, ok := kv.clientMap[op.ClientId]
-	if ok && op.CommandId < commandId {
+	lastCommandId, ok := kv.clientMap[op.ClientId]
+	if ok && op.CommandId <= lastCommandId {
 		return true
 	}
 	return false
 }
-func (kv *KVServer) callBackApplyLoop() {
+func (kv *KVServer) handelApplyLoop() {
 	for !kv.killed() {
-		msg := <-kv.applyCh
-		index := msg.CommandIndex
-		term := msg.CommandTerm
-		op := msg.Command.(Op) // 类型断言，相当于类型转换
-		var response CommandResponse
-		response.Err = OK
-		if !kv.isDuplicate(&op) { //由状态机过滤重复的请求
-			kv.mu.Lock()
-			switch op.Operation {
-			case PUT:
-				kv.kvStore[op.Key] = op.Value
-			case APPEND:
-				kv.kvStore[op.Key] += op.Value
-			case GET:
-				tmpValue, ok := kv.kvStore[op.Key]
-				if !ok {
-					response.Err = ErrNoKey
+		for msg := range kv.applyCh {
+			if msg.CommandValid {
+				op := msg.Command.(Op) // 类型断言，相当于类型转换
+				var response CommandResponse
+				DPrintf("S[%v] got C[%v][%v], msg", kv.me, op.ClientId, op.CommandId)
+				kv.mu.Lock()
+				if msg.CommandIndex <= kv.lastApplied {
+					DPrintf("S[%v] discard C[%v][%v], mag %v", kv.me, op.ClientId, op.CommandId, msg)
+					kv.mu.Unlock()
+					continue
 				}
-				response.Value = tmpValue
+				kv.lastApplied = msg.CommandIndex
+				DPrintf("S[%v] apply C[%v][%v], lastApplied %v", kv.me, op.ClientId, op.CommandId, kv.lastApplied)
+				if op.Operation != GET && kv.isDuplicate(&op) {
+					// 过滤 put 和 append 的重复请求
+					response.Err = OK
+				} else {
+					switch op.Operation {
+					case PUT:
+						kv.kvStore[op.Key] = op.Value
+					case APPEND:
+						kv.kvStore[op.Key] += op.Value
+						response.Err = OK
+					case GET:
+						if tmpValue, ok := kv.kvStore[op.Key]; ok {
+							response.Err = OK
+							response.Value = tmpValue
+						} else {
+							response.Err = ErrNoKey
+						}
+					}
+					kv.clientMap[op.ClientId] = op.CommandId
+				}
+				if currentTerm, isLeader := kv.rf.GetState(); isLeader && currentTerm == msg.CommandTerm {
+					DPrintf("S[%v] send before C[%v][%v], here3, %v", kv.me, op.ClientId, op.CommandId, msg.CommandIndex)
+					ch := kv.getSynChannel(msg.CommandIndex)
+					ch <- response // 发送消息前先解锁
+					DPrintf("S[%v] send after C[%v][%v], here4", kv.me, op.ClientId, op.CommandId)
+				}
+				if kv.ifNeedSnapshot() {
+					kv.makeSnapshot(kv.lastApplied)
+				}
+				kv.mu.Unlock()
+			} else if msg.SnapshotValid {
+				// load snapshot
+				kv.loadSnapshot(msg.SnapshotIndex, msg.Snapshot)
+			} else {
+				DPrintf("error!")
 			}
-			kv.clientMap[op.ClientId] = op.CommandId
-			kv.mu.Unlock()
+			// detect if raftstate too large
+
 		}
-		kv.getSynChannel(IndexTerm{index: index, term: term}) <- response //重复的请求直接返回ok
+	}
+}
+func (kv *KVServer) ifNeedSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+	now_size := kv.persister.RaftStateSize()
+
+	return now_size+100 >= kv.maxraftstate
+}
+
+func (kv *KVServer) makeSnapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(kv.kvStore)
+	e.Encode(kv.clientMap)
+	e.Encode(kv.lastApplied)
+	snapshot := w.Bytes()
+
+	kv.rf.Snapshot(index, snapshot)
+}
+
+func (kv *KVServer) loadSnapshot(index int, snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if index <= kv.lastApplied {
+		return
+	}
+	if d.Decode(&kv.kvStore) != nil || d.Decode(&kv.clientMap) != nil || d.Decode(&kv.lastApplied) != nil {
+		panic("error in parsing snapshot")
 	}
 }
 
@@ -135,14 +199,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv := new(KVServer)
 	kv.me = me
-	kv.maxRaftState = maxraftstate
+	kv.persister = persister
+	kv.maxraftstate = maxraftstate
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.kvStore = make(map[string]string)
 	kv.clientMap = make(map[int64]int64)
-	kv.channelMap = make(map[IndexTerm]chan CommandResponse)
-
-	go kv.callBackApplyLoop()
+	kv.channelMap = make(map[int]chan CommandResponse)
+	kv.lastApplied = 0
+	// 崩溃时获取持久存储
+	kv.loadSnapshot(kv.rf.GetLastIncludeIndex(), kv.persister.ReadSnapshot())
+	go kv.handelApplyLoop()
 	return kv
 }
