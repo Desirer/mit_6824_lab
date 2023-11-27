@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const TIMEOUT_DURATION = 500 * time.Millisecond
+
 type Op struct {
 	Operation int // "get" or "put" or "append"
 	ClientId  int64
@@ -79,7 +81,7 @@ func (kv *KVServer) HandleRequest(request *CommandRequest, response *CommandResp
 		response.Err = result.Err
 		response.Value = result.Value
 		return
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(TIMEOUT_DURATION):
 		response.Err = ErrTimeout
 		DPrintf("S[%v] reply C[%v][%v], timeout", kv.me, request.ClientId, request.CommandId)
 		return
@@ -152,8 +154,6 @@ func (kv *KVServer) handelApplyLoop() {
 			} else {
 				DPrintf("error!")
 			}
-			// detect if raftstate too large
-
 		}
 	}
 }

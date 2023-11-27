@@ -89,18 +89,20 @@ func TestBasic(t *testing.T) {
 
 	cfa := make([]Config, 6)
 	cfa[0] = ck.Query(-1)
-
 	check(t, []int{}, ck)
 
+	fmt.Printf("here1\n")
 	var gid1 int = 1
 	ck.Join(map[int][]string{gid1: []string{"x", "y", "z"}})
 	check(t, []int{gid1}, ck)
 	cfa[1] = ck.Query(-1)
+	fmt.Printf("here2\n")
 
 	var gid2 int = 2
 	ck.Join(map[int][]string{gid2: []string{"a", "b", "c"}})
 	check(t, []int{gid1, gid2}, ck)
 	cfa[2] = ck.Query(-1)
+	fmt.Printf("here3\n")
 
 	cfx := ck.Query(-1)
 	sa1 := cfx.Groups[gid1]
@@ -112,10 +114,12 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("wrong servers for gid %v: %v\n", gid2, sa2)
 	}
 
+	fmt.Printf("here4\n")
 	ck.Leave([]int{gid1})
 	check(t, []int{gid2}, ck)
 	cfa[4] = ck.Query(-1)
 
+	fmt.Printf("here5\n")
 	ck.Leave([]int{gid2})
 	cfa[5] = ck.Query(-1)
 

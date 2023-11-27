@@ -1,5 +1,10 @@
 package shardctrler
 
+import (
+	"log"
+	"sort"
+)
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -28,14 +33,40 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func getGroups(Groups map[int][]string) []int {
+	var ret []int
+	for k, _ := range Groups {
+		ret = append(ret, k)
+	}
+	sort.Ints(ret) // for deterministic
+	return ret
+}
+
+func DeepCopy(oldConfig *Config) Config {
+	var newConfig = Config{
+		Num:    1 + oldConfig.Num,
+		Groups: make(map[int][]string),
+	}
+	for i, num := range oldConfig.Shards {
+		newConfig.Shards[i] = num
+	}
+	for k, v := range oldConfig.Groups {
+		newConfig.Groups[k] = v
+	}
+	return newConfig
+}
+
 const (
-	OK = "OK"
+	OK      = "OK"
+	TIMEOUT = "TIMEOUT"
 )
 
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers  map[int][]string // new GID -> servers mappings
+	ClientId int64
+	SeqNum   int64
 }
 
 type JoinReply struct {
@@ -44,7 +75,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs     []int
+	ClientId int64
+	SeqNum   int64
 }
 
 type LeaveReply struct {
@@ -53,8 +86,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard    int
+	GID      int
+	ClientId int64
+	SeqNum   int64
 }
 
 type MoveReply struct {
@@ -63,11 +98,22 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num      int // desired config number
+	ClientId int64
+	SeqNum   int64
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
 }
