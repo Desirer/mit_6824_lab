@@ -1,18 +1,25 @@
 package shardkv
 
-
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+	"6.5840/shardctrler"
+	"bytes"
+	"sync/atomic"
+	"time"
+)
 import "6.5840/raft"
 import "sync"
 import "6.5840/labgob"
 
+const TIMEOUT_DURATION = 500 * time.Millisecond
+const QUERY_CONIFG_INTERVAL = 100 * time.Millisecond
 
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
+const (
+	Serv    = 1
+	Push    = 2
+	Wait    = 3
+	Discard = 4
+)
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -23,58 +30,182 @@ type ShardKV struct {
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
+	mck          *shardctrler.Clerk
+	persister    *raft.Persister
 
-	// Your definitions here.
+	dead int32 // set by Kill()
+
+	lastApplied int
+	kvStore     map[int]map[string]string // shard id -> key value store
+	clientMap   map[int]map[int64]int64   // shard id -> key value store
+	notifyChMap map[int]chan UniversalReply
+	leaderMap   map[int]int // gid -> leader id
+	shardState  map[int]int //当前负责的分片状态：Serv、Push、Wait、Discard
+
+	curCfg          shardctrler.Config //目前的配置
+	nxtCfg          shardctrler.Config // 下一个配置
+	curCfgNum       int                //目前的配置版本
+	pushShardArgsCh chan loadShardArgs // 推送分片的参数通道
 }
 
+func (kv *ShardKV) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.rf.Kill()
+}
+
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
+func (kv *ShardKV) isResponsible(shard int) bool {
+	state, ok := kv.shardState[shard]
+	if !ok {
+		return false
+	}
+	return state == Serv
+}
+
+func (kv *ShardKV) isDuplicated(shardIdx int, clinetId int64, seqNum int64) bool {
+	lastSeqNum, ok := kv.clientMap[shardIdx][clinetId]
+	if !ok {
+		return false
+	}
+	return seqNum <= lastSeqNum
+}
+
+func (kv *ShardKV) getNotifyCh(index int) chan UniversalReply {
+	ch, ok := kv.notifyChMap[index]
+	if !ok {
+		kv.notifyChMap[index] = make(chan UniversalReply, 1)
+		ch = kv.notifyChMap[index]
+	}
+	return ch
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	shard := key2shard(args.Key)
+	defer DPrintf("G%v S%v reply read C[%v][%v] Shard%v, %v", kv.gid, kv.me, args.ClientId, args.SeqNum, shard, reply)
+	kv.mu.Lock()
+	if !kv.isResponsible(shard) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	op := Op{ShardIdx: shard, Key: args.Key, ClientIdx: args.ClientId, SeqNum: args.SeqNum}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	ch := kv.getNotifyCh(index)
+	kv.mu.Unlock()
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.notifyChMap, index)
+		kv.mu.Unlock()
+	}()
+	select {
+	case ureply := <-ch:
+		{
+			reply.Err = ureply.Err
+			reply.Value = ureply.Value
+			return
+		}
+	case <-time.After(TIMEOUT_DURATION):
+		{
+			reply.Err = ErrTimeout
+			return
+		}
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	shard := key2shard(args.Key)
+	defer DPrintf("G%v S%v reply PutAppend C[%v][%v] Shard%v, %v", kv.gid, kv.me, args.ClientId, args.SeqNum, shard, reply)
+	kv.mu.Lock()
+	if !kv.isResponsible(shard) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	if kv.isDuplicated(shard, args.ClientId, args.SeqNum) {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	op := Op{ShardIdx: shard, Key: args.Key, Value: args.Value, ClientIdx: args.ClientId, SeqNum: args.SeqNum}
+	if args.Op == "Put" {
+		op.Operation = PUT
+	} else {
+		op.Operation = APPEND
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	ch := kv.getNotifyCh(index)
+	kv.mu.Unlock()
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.notifyChMap, index)
+		kv.mu.Unlock()
+	}()
+	select {
+	case ureply := <-ch:
+		{
+			reply.Err = ureply.Err
+			return
+		}
+	case <-time.After(TIMEOUT_DURATION):
+		{
+			reply.Err = ErrTimeout
+			return
+		}
+	}
 }
 
-// the tester calls Kill() when a ShardKV instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
-func (kv *ShardKV) Kill() {
-	kv.rf.Kill()
-	// Your code here, if desired.
+func (kv *ShardKV) ifNeedSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+	now_size := kv.persister.RaftStateSize()
+
+	return now_size+100 >= kv.maxraftstate
 }
 
+func (kv *ShardKV) makeSnapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
 
-// servers[] contains the ports of the servers in this group.
-//
-// me is the index of the current server in servers[].
-//
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-//
-// the k/v server should snapshot when Raft's saved state exceeds
-// maxraftstate bytes, in order to allow Raft to garbage-collect its
-// log. if maxraftstate is -1, you don't need to snapshot.
-//
-// gid is this group's GID, for interacting with the shardctrler.
-//
-// pass ctrlers[] to shardctrler.MakeClerk() so you can send
-// RPCs to the shardctrler.
-//
-// make_end(servername) turns a server name from a
-// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
-// send RPCs. You'll need this to send RPCs to other groups.
-//
-// look at client.go for examples of how to use ctrlers[]
-// and make_end() to send RPCs to the group owning a specific shard.
-//
-// StartServer() must return quickly, so it should start goroutines
-// for any long-running work.
+	e.Encode(kv.kvStore)
+	e.Encode(kv.clientMap)
+	e.Encode(kv.lastApplied)
+	snapshot := w.Bytes()
+	// 持有锁，确保kv.lastApplied不会改变
+	kv.rf.Snapshot(kv.lastApplied, snapshot)
+}
+
+func (kv *ShardKV) loadSnapshot(index int, snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if index <= kv.lastApplied {
+		return
+	}
+	if d.Decode(&kv.kvStore) != nil || d.Decode(&kv.clientMap) != nil || d.Decode(&kv.lastApplied) != nil {
+		panic("error in parsing snapshot")
+	}
+}
+
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
 	kv := new(ShardKV)
@@ -84,14 +215,26 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.gid = gid
 	kv.ctrlers = ctrlers
 
-	// Your initialization code here.
-
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers) //to connect with shardctrler
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.kvStore = make(map[int]map[string]string)
+	kv.clientMap = make(map[int]map[int64]int64)
+	kv.notifyChMap = make(map[int]chan UniversalReply)
+	kv.leaderMap = make(map[int]int)
+	kv.shardState = make(map[int]int)
 
+	kv.curCfg = shardctrler.Config{} // all shards all given to 0
+	kv.nxtCfg = shardctrler.Config{}
+	kv.curCfgNum = 0
+	kv.pushShardArgsCh = make(chan loadShardArgs, 10) // 10个分片，10个缓冲区
+
+	go kv.handleApplyLoop()
+
+	go kv.queryConfigLoop()
+	go kv.tryPushShardLoop()
+	go kv.pushShardLoop()
 	return kv
 }

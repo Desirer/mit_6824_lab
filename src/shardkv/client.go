@@ -38,6 +38,9 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId  int64
+	seqNum    int64
+	leaderMap map[int]int
 }
 
 // the tester calls MakeClerk.
@@ -52,6 +55,9 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.seqNum = 0
+	ck.leaderMap = make(map[int]int)
 	return ck
 }
 
@@ -62,23 +68,29 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
-
+	args.ClientId = ck.clientId
+	args.SeqNum = ck.seqNum
 	for {
 		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
+		gid := ck.config.Shards[shard]                //通过配置找到分片具体负责的组id
+		if servers, ok := ck.config.Groups[gid]; ok { //通过组id找到具体的server列表
 			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+			sidx := ck.leaderMap[gid] % len(servers)
+			srv := ck.make_end(servers[sidx])
+			var reply GetReply
+			ok := srv.Call("ShardKV.Get", &args, &reply)
+			if ok {
+				if reply.Err == OK || reply.Err == ErrNoKey {
+					ck.seqNum++
 					return reply.Value
+				} else if reply.Err == ErrWrongLeader {
+					ck.leaderMap[gid] = (ck.leaderMap[gid] + 1) % len(servers)
+					continue
+				} else if reply.Err == ErrTimeout {
+					continue
+				} else if reply.Err == ErrWrongGroup {
+					// sleep 之后会询问最新配置，所以不用特殊处理
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -96,23 +108,29 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
-
+	args.ClientId = ck.clientId
+	args.SeqNum = ck.seqNum
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
+			// try each server for the shard.
+			sidx := ck.leaderMap[gid] % len(servers)
+			srv := ck.make_end(servers[sidx])
+			var reply GetReply
+			ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+			if ok {
+				if reply.Err == OK || reply.Err == ErrNoKey {
+					ck.seqNum++
 					return
+				} else if reply.Err == ErrWrongLeader {
+					ck.leaderMap[gid] = (ck.leaderMap[gid] + 1) % len(servers)
+					continue
+				} else if reply.Err == ErrTimeout {
+					continue
+				} else if reply.Err == ErrWrongGroup {
+					// do no thing 之后会询问最新配置，所以不用特殊处理
 				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
