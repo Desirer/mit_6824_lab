@@ -1,5 +1,7 @@
 package shardctrler
 
+import "sort"
+
 // 状态机应用请求，重复请求直接返回Ok
 func (sc *ShardCtrler) handleQuery(args *QueryArgs, reply *QueryReply) {
 	//DPrintf("SC[%v] handleQuery C[%v][%v]", sc.me, args.ClientId, args.SeqNum)
@@ -13,6 +15,59 @@ func (sc *ShardCtrler) handleQuery(args *QueryArgs, reply *QueryReply) {
 	return
 }
 
+// gid -> [shards]
+// Group到shard的对应
+func Group2Shards(cfg *Config) map[int][]int {
+	var ret map[int][]int
+	ret = make(map[int][]int)
+	for gid, _ := range cfg.Groups {
+		ret[gid] = make([]int, 0)
+	}
+	for shard, gid := range cfg.Shards {
+		ret[gid] = append(ret[gid], shard)
+	}
+	return ret
+}
+
+func GetGIDWithMaximumShards(s2g *map[int][]int) int {
+	rGid := 0
+	rLen := -1
+	tmp := make([]int, 0)
+	for k, v := range *s2g {
+		if k == 0 && len(v) != 0 {
+			return 0
+		}
+		tmp = append(tmp, k)
+	}
+	sort.Ints(tmp)
+	for _, k := range tmp {
+		v := (*s2g)[k]
+		if len(v) > rLen {
+			rLen = len(v)
+			rGid = k
+		}
+	}
+	return rGid
+}
+
+func GetGIDWithMinimumShards(s2g *map[int][]int) int {
+	rGid := 0
+	rLen := 99
+	tmp := make([]int, 0)
+	for k, _ := range *s2g {
+		tmp = append(tmp, k)
+	}
+	sort.Ints(tmp)
+	for _, k := range tmp {
+		v := (*s2g)[k]
+		if k != 0 && len(v) < rLen {
+			rLen = len(v)
+			rGid = k
+		}
+	}
+	return rGid
+}
+
 /*
 增加若干个group，遵循给出原则进行分配。先计算平均情况每个group应该具有的shard数，然后多的给新来的
 */
@@ -23,49 +78,35 @@ func (sc *ShardCtrler) handleJoin(args *JoinArgs, reply *JoinReply) {
 	}
 	sc.clientMap[args.ClientId] = args.SeqNum
 	newConfig := DeepCopy(&sc.configs[len(sc.configs)-1])
-	// 1、添加group到新config
-	for k, v := range args.Servers {
-		newConfig.Groups[k] = v
-	}
-	// 2、计算平均情况下，每个group应该具有的shard数，向下取整
-	totalGroupNum := len(newConfig.Groups)
-	averageShardNum := NShards / totalGroupNum
-	if averageShardNum < 1 {
-		averageShardNum = 1 // 此时的group多于shard
-	}
-	// 3、遍历Shard数组，统计[可回收的shard]
-	shardCount := make(map[int]int) // 每个gid具有的shard个数
-	var recycledShards []int
-	for sid, gid := range newConfig.Shards {
-		if gid == 0 || shardCount[gid] >= averageShardNum { //0表示未分配
-			recycledShards = append(recycledShards, sid)
-			continue
+	//lastConfig := sc.configs[len(sc.configs)-1]
+	//newConfig := Config{len(sc.configs), lastConfig.Shards, deepCopy(lastConfig.Groups)}
+	for gid, servers := range args.Servers {
+		if _, ok := newConfig.Groups[gid]; !ok {
+			newServers := make([]string, len(servers))
+			copy(newServers, servers)
+			newConfig.Groups[gid] = newServers
 		}
-		shardCount[gid]++
 	}
-	// 4、分配回收的shard到groups中
-	newGroups := getGroups(newConfig.Groups)
-	sidx := 0
-	gidx := 0
-	// 遍历groups，将每个group补全至averageNum
-	for gidx < len(newGroups) {
-		gid := newGroups[gidx]
-		if sidx < len(recycledShards) && shardCount[gid] < averageShardNum {
-			newConfig.Shards[recycledShards[sidx]] = gid
-			shardCount[gid]++
-			sidx++
-			continue
+	//for k, v := range args.Servers {
+	//	newConfig.Groups[k] = v
+	//}
+	s2g := Group2Shards(&newConfig)
+	for {
+		source, target := GetGIDWithMaximumShards(&s2g), GetGIDWithMinimumShards(&s2g)
+		DPrintf("source=%v target=%v", source, target)
+		if source != 0 && len(s2g[source])-len(s2g[target]) <= 1 {
+			break
 		}
-		gidx++
+		s2g[target] = append(s2g[target], s2g[source][0])
+		s2g[source] = s2g[source][1:]
 	}
-	// 如果recycledShards还有剩余，循环发给每个group
-	gidx = 0
-	for sidx < len(recycledShards) && gidx < len(newGroups) {
-		gid := newGroups[gidx]
-		newConfig.Shards[recycledShards[sidx]] = gid
-		sidx++
-		gidx++
+	var newShards [NShards]int
+	for gid, shards := range s2g {
+		for _, shard := range shards {
+			newShards[shard] = gid
+		}
 	}
+	newConfig.Shards = newShards
 	sc.configs = append(sc.configs, newConfig)
 	reply.Err = OK
 	DPrintf("SC[%v] handleJoin C[%v][%v], new config%v", sc.me, args.ClientId, args.SeqNum, newConfig)
@@ -83,63 +124,31 @@ func (sc *ShardCtrler) handleLeave(args *LeaveArgs, reply *LeaveReply) {
 	}
 	sc.clientMap[args.ClientId] = args.SeqNum
 	newConfig := DeepCopy(&sc.configs[len(sc.configs)-1])
-	// 1、删除group从config
-	leavingGroups := make(map[int]bool)
+	s2g := Group2Shards(&newConfig)
+	orphanShards := make([]int, 0)
 	for _, gid := range args.GIDs {
-		delete(newConfig.Groups, gid)
-		leavingGroups[gid] = true
-	}
-	// 2、计算平均情况下，每个group应该具有的shard数，向下取整
-	var averageShardNum int
-	totalGroupNum := len(newConfig.Groups)
-	if totalGroupNum == 0 {
-		averageShardNum = 999
-	} else if totalGroupNum > NShards {
-		averageShardNum = 1
-	} else {
-		averageShardNum = NShards / totalGroupNum
-	}
-	// 3、遍历Shard数组，统计可回收的shard
-	shardCount := make(map[int]int) // 每个gid具有的shard个数
-	var recycledShards []int
-	for sid, gid := range newConfig.Shards {
-		// 如果gid在leavingGroup中，就回收它对应的shard
-		if _, ok := leavingGroups[gid]; ok {
-			newConfig.Shards[sid] = 0
-			gid = 0
+		if _, ok := newConfig.Groups[gid]; ok {
+			delete(newConfig.Groups, gid)
 		}
-		// 如果未分配或者超出了average的数额,就回收
-		if gid == 0 || shardCount[gid] >= averageShardNum {
-			recycledShards = append(recycledShards, sid)
-			continue
+		if shards, ok := s2g[gid]; ok {
+			orphanShards = append(orphanShards, shards...)
+			delete(s2g, gid)
 		}
-		shardCount[gid]++
 	}
-	//DPrintf("SC[%v]C[%v][%v], recycledShards%v, leftGroups%v, newConfig.Groups %v", sc.me, args.ClientId, args.SeqNum, recycledShards, leftGroups, newConfig.Groups)
-	// 4、分配shard
-	newGroups := getGroups(newConfig.Groups)
-	sidx := 0
-	gidx := 0
-	// 遍历groups，将每个group补全至averageNum
-	for gidx < len(newGroups) {
-		gid := newGroups[gidx]
-		if sidx < len(recycledShards) && shardCount[gid] < averageShardNum {
-			newConfig.Shards[recycledShards[sidx]] = gid
-			shardCount[gid]++
-			sidx++
-			continue
+	var newShards [NShards]int
+	// load balancing is performed only when raft groups exist
+	if len(newConfig.Groups) != 0 {
+		for _, shard := range orphanShards {
+			target := GetGIDWithMinimumShards(&s2g)
+			s2g[target] = append(s2g[target], shard)
 		}
-		gidx++
+		for gid, shards := range s2g {
+			for _, shard := range shards {
+				newShards[shard] = gid
+			}
+		}
 	}
-	// 如果recycledShards还有剩余，循环发给每个group
-	gidx = 0
-	for sidx < len(recycledShards) && gidx < len(newGroups) {
-		gid := newGroups[gidx]
-		newConfig.Shards[recycledShards[sidx]] = gid
-		sidx++
-		gidx++
-	}
-
+	newConfig.Shards = newShards
 	sc.configs = append(sc.configs, newConfig)
 	reply.Err = OK
 	return
