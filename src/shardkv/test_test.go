@@ -47,6 +47,7 @@ func TestStaticShards(t *testing.T) {
 	// make sure that the data really is sharded by
 	// shutting down one shard and checking that some
 	// Get()s don't succeed.
+	DPrintf("--------here1----------")
 	cfg.ShutdownGroup(1)
 	cfg.checklogs() // forbid snapshots
 
@@ -62,6 +63,7 @@ func TestStaticShards(t *testing.T) {
 			}
 		}(xi)
 	}
+	DPrintf("--------here2----------")
 
 	// wait a bit, only about half the Gets should succeed.
 	ndone := 0
@@ -83,6 +85,7 @@ func TestStaticShards(t *testing.T) {
 		t.Fatalf("expected 5 completions with one shard dead; got %v\n", ndone)
 	}
 
+	DPrintf("--------here3----------")
 	// bring the crashed shard/group back to life.
 	cfg.StartGroup(1)
 	for i := 0; i < n; i++ {
@@ -100,6 +103,7 @@ func TestJoinLeave(t *testing.T) {
 
 	ck := cfg.makeClient()
 
+	DPrintf("----here1----")
 	cfg.join(0)
 
 	n := 10
@@ -114,6 +118,7 @@ func TestJoinLeave(t *testing.T) {
 		check(t, ck, ka[i], va[i])
 	}
 
+	DPrintf("----here2----")
 	cfg.join(1)
 
 	for i := 0; i < n; i++ {
@@ -123,6 +128,7 @@ func TestJoinLeave(t *testing.T) {
 		va[i] += x
 	}
 
+	DPrintf("----here3----")
 	cfg.leave(0)
 
 	for i := 0; i < n; i++ {
@@ -136,8 +142,10 @@ func TestJoinLeave(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	cfg.checklogs()
+	DPrintf("----here4----")
 	cfg.ShutdownGroup(0)
 
+	DPrintf("----here5----")
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
@@ -166,6 +174,7 @@ func TestSnapshot(t *testing.T) {
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
+	DPrintf("----here1----")
 
 	cfg.join(1)
 	cfg.join(2)
@@ -177,6 +186,7 @@ func TestSnapshot(t *testing.T) {
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
+	DPrintf("----here2----")
 
 	cfg.leave(1)
 	cfg.join(0)
@@ -187,6 +197,7 @@ func TestSnapshot(t *testing.T) {
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
+	DPrintf("----here3----")
 
 	time.Sleep(1 * time.Second)
 
@@ -202,6 +213,7 @@ func TestSnapshot(t *testing.T) {
 	cfg.ShutdownGroup(1)
 	cfg.ShutdownGroup(2)
 
+	DPrintf("----here4----")
 	cfg.StartGroup(0)
 	cfg.StartGroup(1)
 	cfg.StartGroup(2)
@@ -222,7 +234,6 @@ func TestMissChange(t *testing.T) {
 	ck := cfg.makeClient()
 
 	cfg.join(0)
-
 	n := 10
 	ka := make([]string, n)
 	va := make([]string, n)
@@ -235,6 +246,7 @@ func TestMissChange(t *testing.T) {
 		check(t, ck, ka[i], va[i])
 	}
 
+	DPrintf("--here1----")
 	cfg.join(1)
 
 	cfg.ShutdownServer(0, 0)
@@ -252,6 +264,7 @@ func TestMissChange(t *testing.T) {
 		va[i] += x
 	}
 
+	DPrintf("--here2----")
 	cfg.join(1)
 
 	for i := 0; i < n; i++ {
@@ -272,7 +285,9 @@ func TestMissChange(t *testing.T) {
 		va[i] += x
 	}
 
+	DPrintf("--here3----")
 	time.Sleep(2 * time.Second)
+	DPrintf("--here4----")
 
 	cfg.ShutdownServer(0, 1)
 	cfg.ShutdownServer(1, 1)
@@ -281,17 +296,21 @@ func TestMissChange(t *testing.T) {
 	cfg.join(0)
 	cfg.leave(2)
 
+	DPrintf("--here5----")
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 		x := randstring(20)
+		println("send %v", i)
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
+	DPrintf("--here6----")
 
 	cfg.StartServer(0, 1)
 	cfg.StartServer(1, 1)
 	cfg.StartServer(2, 1)
 
+	DPrintf("--here7----")
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}

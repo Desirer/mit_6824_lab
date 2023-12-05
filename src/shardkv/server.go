@@ -37,15 +37,15 @@ type ShardKV struct {
 
 	lastApplied int
 	kvStore     map[int]map[string]string // shard id -> key value store
-	clientMap   map[int]map[int64]int64   // shard id -> key value store
+	clientMap   map[int]map[int64]int64   // shard id -> clientId seqNum
 	notifyChMap map[int]chan UniversalReply
 	leaderMap   map[int]int // gid -> leader id
-	shardState  map[int]int //当前负责的分片状态：Serv、Push、Wait、Discard
+	shardState  map[int]int // 当前负责的分片状态：Serv、Push、Wait、Discard
 
-	curCfg          shardctrler.Config //目前的配置
-	nxtCfg          shardctrler.Config // 下一个配置
-	curCfgNum       int                //目前的配置版本
-	pushShardArgsCh chan loadShardArgs // 推送分片的参数通道
+	preCfg shardctrler.Config // 前一个配置
+	curCfg shardctrler.Config // 目前配置
+	//curCfgNum       int                // 目前的配置版本
+	pushShardArgsCh chan LoadShardArgs // 推送分片的参数通道
 }
 
 func (kv *ShardKV) Kill() {
@@ -85,14 +85,14 @@ func (kv *ShardKV) getNotifyCh(index int) chan UniversalReply {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	shard := key2shard(args.Key)
-	defer DPrintf("G%v S%v reply read C[%v][%v] Shard%v, %v", kv.gid, kv.me, args.ClientId, args.SeqNum, shard, reply)
+	defer DPrintf("G%v S%v reply Get C[%v][%v] Shard%v, %v", kv.gid, kv.me, args.ClientId, args.SeqNum, shard, reply)
 	kv.mu.Lock()
 	if !kv.isResponsible(shard) {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
 	}
-	op := Op{ShardIdx: shard, Key: args.Key, ClientIdx: args.ClientId, SeqNum: args.SeqNum}
+	op := Op{Operation: GET, ShardIdx: shard, Key: args.Key, ClientIdx: args.ClientId, SeqNum: args.SeqNum}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -184,6 +184,10 @@ func (kv *ShardKV) makeSnapshot() {
 	e.Encode(kv.kvStore)
 	e.Encode(kv.clientMap)
 	e.Encode(kv.lastApplied)
+	e.Encode(kv.shardState)
+	e.Encode(kv.preCfg)
+	e.Encode(kv.curCfg)
+	//e.Encode(kv.curCfgNum)
 	snapshot := w.Bytes()
 	// 持有锁，确保kv.lastApplied不会改变
 	kv.rf.Snapshot(kv.lastApplied, snapshot)
@@ -200,7 +204,10 @@ func (kv *ShardKV) loadSnapshot(index int, snapshot []byte) {
 	if index <= kv.lastApplied {
 		return
 	}
-	if d.Decode(&kv.kvStore) != nil || d.Decode(&kv.clientMap) != nil || d.Decode(&kv.lastApplied) != nil {
+	if d.Decode(&kv.kvStore) != nil || d.Decode(&kv.clientMap) != nil ||
+		d.Decode(&kv.lastApplied) != nil || d.Decode(&kv.shardState) != nil ||
+		d.Decode(&kv.preCfg) != nil || d.Decode(&kv.curCfg) != nil {
+		//|| d.Decode(&kv.curCfgNum) != nil {
 		panic("error in parsing snapshot")
 	}
 }
@@ -225,14 +232,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.notifyChMap = make(map[int]chan UniversalReply)
 	kv.leaderMap = make(map[int]int)
 	kv.shardState = make(map[int]int)
+	for i := 0; i < 10; i++ {
+		kv.clientMap[i] = make(map[int64]int64)
+		kv.kvStore[i] = make(map[string]string)
+	}
 
-	kv.curCfg = shardctrler.Config{} // all shards all given to 0
-	kv.nxtCfg = shardctrler.Config{}
-	kv.curCfgNum = 0
-	kv.pushShardArgsCh = make(chan loadShardArgs, 10) // 10个分片，10个缓冲区
+	kv.preCfg = shardctrler.Config{} // all shards all given to 0
+	kv.curCfg = shardctrler.Config{}
+	kv.pushShardArgsCh = make(chan LoadShardArgs, 10) // 10个分片，10个缓冲区
+	kv.loadSnapshot(kv.rf.GetLastIncludeIndex(), kv.persister.ReadSnapshot())
 
+	DPrintf("G%v S%v start again! ", kv.gid, kv.me)
 	go kv.handleApplyLoop()
-
 	go kv.queryConfigLoop()
 	go kv.tryPushShardLoop()
 	go kv.pushShardLoop()

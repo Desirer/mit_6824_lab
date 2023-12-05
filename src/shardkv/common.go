@@ -47,7 +47,7 @@ type GetReply struct {
 	Value string
 }
 
-type loadShardArgs struct {
+type LoadShardArgs struct {
 	TargetGid int               // 目标组号
 	Num       int               // shard所属config的版本号
 	ShardIdx  int               // shard 索引
@@ -55,11 +55,27 @@ type loadShardArgs struct {
 	ClientMap map[int64]int64   // 客户端历史
 }
 
-type loadShardReply struct {
+type LoadShardReply struct {
 	Err Err
 }
 
-const Debug = true
+func DeepCopyString(x map[string]string) map[string]string {
+	y := make(map[string]string)
+	for k, v := range x {
+		y[k] = v
+	}
+	return y
+}
+
+func DeepCopyInt64(x map[int64]int64) map[int64]int64 {
+	y := make(map[int64]int64)
+	for k, v := range x {
+		y[k] = v
+	}
+	return y
+}
+
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {

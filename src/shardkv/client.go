@@ -8,7 +8,9 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+)
 import "crypto/rand"
 import "math/big"
 import "6.5840/shardctrler"
@@ -70,26 +72,30 @@ func (ck *Clerk) Get(key string) string {
 	args.Key = key
 	args.ClientId = ck.clientId
 	args.SeqNum = ck.seqNum
+
 	for {
 		shard := key2shard(key)
-		gid := ck.config.Shards[shard]                //通过配置找到分片具体负责的组id
-		if servers, ok := ck.config.Groups[gid]; ok { //通过组id找到具体的server列表
-			// try each server for the shard.
-			sidx := ck.leaderMap[gid] % len(servers)
-			srv := ck.make_end(servers[sidx])
-			var reply GetReply
-			ok := srv.Call("ShardKV.Get", &args, &reply)
-			if ok {
-				if reply.Err == OK || reply.Err == ErrNoKey {
+		gid := ck.config.Shards[shard]
+		if servers, ok := ck.config.Groups[gid]; ok {
+			oldLeaderId := ck.leaderMap[gid] % len(servers)
+			newLeaderId := oldLeaderId
+			for {
+				srv := ck.make_end(servers[newLeaderId])
+				var reply GetReply
+				DPrintf("C[%v][%v] get G[%v]S[%v] ", ck.clientId, ck.seqNum, gid, newLeaderId)
+				ok := srv.Call("ShardKV.Get", &args, &reply)
+				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					ck.seqNum++
 					return reply.Value
-				} else if reply.Err == ErrWrongLeader {
-					ck.leaderMap[gid] = (ck.leaderMap[gid] + 1) % len(servers)
-					continue
-				} else if reply.Err == ErrTimeout {
-					continue
-				} else if reply.Err == ErrWrongGroup {
-					// sleep 之后会询问最新配置，所以不用特殊处理
+				}
+				if ok && reply.Err == ErrWrongGroup {
+					break
+				}
+				// ... not ok, or ErrWrongLeader
+				ck.leaderMap[gid] = (ck.leaderMap[gid] + 1) % len(servers)
+				newLeaderId = ck.leaderMap[gid]
+				if newLeaderId == oldLeaderId {
+					break
 				}
 			}
 		}
@@ -114,22 +120,24 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			sidx := ck.leaderMap[gid] % len(servers)
-			srv := ck.make_end(servers[sidx])
-			var reply GetReply
-			ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-			if ok {
-				if reply.Err == OK || reply.Err == ErrNoKey {
+			oldLeaderId := ck.leaderMap[gid] % len(servers)
+			newLeaderId := oldLeaderId
+			for {
+				srv := ck.make_end(servers[newLeaderId])
+				var reply GetReply
+				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				if ok && reply.Err == OK {
 					ck.seqNum++
 					return
-				} else if reply.Err == ErrWrongLeader {
-					ck.leaderMap[gid] = (ck.leaderMap[gid] + 1) % len(servers)
-					continue
-				} else if reply.Err == ErrTimeout {
-					continue
-				} else if reply.Err == ErrWrongGroup {
-					// do no thing 之后会询问最新配置，所以不用特殊处理
+				}
+				if ok && reply.Err == ErrWrongGroup {
+					break
+				}
+				// ... not ok, or ErrWrongLeader
+				ck.leaderMap[gid] = (ck.leaderMap[gid] + 1) % len(servers)
+				newLeaderId = ck.leaderMap[gid]
+				if newLeaderId == oldLeaderId {
+					break
 				}
 			}
 		}
